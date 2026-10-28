@@ -1,0 +1,32 @@
+# Pre-commit configuration for local Git validation
+# Rename this file to .pre-commit-config.yaml in your repository root
+
+repos:
+  - repo: local
+    hooks:
+      - id: trailing-whitespace
+        name: trim-trailing-whitespace
+        entry: trailing-whitespace-fixer
+        language: system
+
+      - id: end-of-file-fixer
+        name: fix-end-of-files
+        entry: end-of-file-fixer
+        language: system
+
+      - id: check-yaml
+        name: check-yaml
+        entry: check-yaml
+        language: system
+
+      - id: black
+        name: black-formatter
+        entry: black
+        language: system
+        types: [python]
+
+      - id: flake8
+        name: flake8-linter
+        entry: flake8
+        language: system
+        types: [python]
