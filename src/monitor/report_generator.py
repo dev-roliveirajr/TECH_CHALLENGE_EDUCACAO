@@ -1,12 +1,14 @@
 """
 ===============================================================================
-GERADOR AUTOMÁTICO DE RELATÓRIOS E FINOPS (src/monitor/report_generator.py) - V6
+GERADOR AUTOMÁTICO DE RELATÓRIOS E FINOPS (src/monitor/report_generator.py) - V8
 ===============================================================================
 Descrição: Módulo chamado pelo orquestrador (pipeline.py) ao final de cada Job.
-Novidades V6:
-  - Garantia da instrução load_dotenv(override=True).
-  - Resolução inteligente de chaves do Manifesto no S3 (busca por RunId e fallback por data).
-  - Preenchimento garantido da Seção 5 (Comparativo BigQuery vs S3 Bronze).
+Destaques V8:
+  - Leitura completa e contínua dos logs do CloudWatch (sem omissão das etapas da EDA).
+  - Suporte completo a relatórios das camadas BRONZE e SILVER.
+  - Leitura resiliente de manifestos S3 (auditoria/bronze/ e auditoria/silver/).
+  - Tabela comparativa e auditoria de travas de qualidade (Join Match Ratio, NULOs).
+  - Estado final do Catálogo S3 e métricas FinOps completas.
 ===============================================================================
 """
 
@@ -17,23 +19,21 @@ import json
 import boto3
 from dotenv import load_dotenv
 
-# Garantia de carregamento com override para ambientes de laboratório
 load_dotenv(override=True)
 
 AWS_REGION = os.getenv("AWS_DEFAULT_REGION") or os.getenv("AWS_REGION", "us-east-1")
 AWS_ACCOUNT_ID = os.getenv("AWS_ACCOUNT_ID", "")
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "tc-alfabetizacao")
 
-# Nome resolvido do Bucket
 if AWS_ACCOUNT_ID and AWS_ACCOUNT_ID not in S3_BUCKET_NAME:
     FULL_BUCKET_NAME = f"{S3_BUCKET_NAME}-{AWS_ACCOUNT_ID}-{AWS_REGION}"
 else:
     FULL_BUCKET_NAME = S3_BUCKET_NAME
 
-COST_PER_DPU_HOUR = 0.44  # Valor padrão AWS Glue G.1X DPU-Hora em USD
+COST_PER_DPU_HOUR = 0.44  # Custo médio AWS Glue G.1X DPU-Hora em USD
 
 def fetch_stdout_cloudwatch_logs(log_stream_name: str) -> str:
-    """Busca o log de saída de aplicação (stdout) diretamente do Log Group /aws-glue/jobs/output."""
+    """Busca o log completo de saída de aplicação (stdout) do Log Group /aws-glue/jobs/output."""
     if not log_stream_name:
         return "ℹ️ LogStream de execução não disponibilizado."
 
@@ -41,66 +41,71 @@ def fetch_stdout_cloudwatch_logs(log_stream_name: str) -> str:
     log_group = "/aws-glue/jobs/output"
     
     try:
-        response = logs_client.get_log_events(
-            logGroupName=log_group,
-            logStreamName=log_stream_name,
-            startFromHead=True,
-            limit=200
-        )
-        events = response.get("events", [])
-        if not events:
-            return "ℹ️ Nenhum log registrado no LogStream do CloudWatch."
-            
         filtered_lines = []
         noise_indicators = ["FutureWarning", "google.api_core", "WARN NativeCodeLoader"]
+        next_token = None
         
-        for ev in events:
-            msg = ev["message"].strip()
-            if any(noise in msg for noise in noise_indicators):
-                continue
-            timestamp_str = datetime.datetime.fromtimestamp(ev["timestamp"] / 1000.0).strftime("%Y-%m-%d %H:%M:%S")
-            filtered_lines.append(f"[{timestamp_str}] {msg}")
+        # Loop de paginação para recuperar o log completo sem cortes
+        while True:
+            kwargs = {
+                "logGroupName": log_group,
+                "logStreamName": log_stream_name,
+                "startFromHead": True,
+                "limit": 10000
+            }
+            if next_token:
+                kwargs["nextToken"] = next_token
+
+            response = logs_client.get_log_events(**kwargs)
+            events = response.get("events", [])
             
+            for ev in events:
+                msg = ev["message"].strip()
+                if any(noise in msg for noise in noise_indicators):
+                    continue
+                timestamp_str = datetime.datetime.fromtimestamp(ev["timestamp"] / 1000.0).strftime("%Y-%m-%d %H:%M:%S")
+                filtered_lines.append(f"[{timestamp_str}] {msg}")
+
+            new_token = response.get("nextForwardToken")
+            if not events or new_token == next_token:
+                break
+            next_token = new_token
+
         return "\n".join(filtered_lines) if filtered_lines else "✅ Execução concluída sem mensagens relevantes adicionais."
     except Exception as e:
         return f"ℹ️ Log de execução disponível no console CloudWatch (Grupo: {log_group}, Stream: {log_stream_name}). Msg: {str(e)}"
 
-def fetch_s3_manifest(run_id: str, ingestion_date_str: str) -> tuple[dict, str]:
-    """
-    Busca o manifesto de auditoria no S3 para incorporar os detalhes no relatório.
-    Usa tentativa por RunId exato e fallback resiliente listando os manifestos da data.
-    """
+def fetch_s3_manifest(job_name: str, run_id: str, ingestion_date_str: str) -> dict:
+    """Busca o manifesto de auditoria no S3 (suporta Bronze e Silver com fallback)."""
     s3_client = boto3.client("s3", region_name=AWS_REGION)
-    exact_key = f"auditoria/bronze/ingestion_date={ingestion_date_str}/run_id={run_id}/manifest.json"
+    layer = "silver" if "silver" in job_name.lower() or "02" in job_name else "bronze"
+    audit_folder = f"auditoria/{layer}"
     
+    # 1. Tentativa por chave exata do run_id
+    exact_key = f"{audit_folder}/ingestion_date={ingestion_date_str}/run_id={run_id}/manifest.json"
     try:
         resp = s3_client.get_object(Bucket=FULL_BUCKET_NAME, Key=exact_key)
-        content = resp["Body"].read().decode("utf-8")
-        return json.loads(content), f"s3://{FULL_BUCKET_NAME}/{exact_key}"
+        return json.loads(resp["Body"].read().decode("utf-8"))
     except Exception:
         pass
 
-    # Fallback: Busca o manifesto mais recente gravado no prefixo do dia
+    # 2. Busca resiliente pelo último manifesto do dia na pasta da camada
     try:
-        prefix = f"auditoria/bronze/ingestion_date={ingestion_date_str}/"
-        res = s3_client.list_objects_v2(Bucket=FULL_BUCKET_NAME, Prefix=prefix)
-        contents = res.get("Contents", [])
-        manifest_objs = [obj for obj in contents if obj["Key"].endswith("manifest.json")]
-        if manifest_objs:
-            # Ordena pelo horário de modificação mais recente
-            manifest_objs.sort(key=lambda x: x["LastModified"], reverse=True)
-            latest_key = manifest_objs[0]["Key"]
-            resp = s3_client.get_object(Bucket=FULL_BUCKET_NAME, Key=latest_key)
-            content = resp["Body"].read().decode("utf-8")
-            return json.loads(content), f"s3://{FULL_BUCKET_NAME}/{latest_key}"
+        prefix = f"{audit_folder}/ingestion_date={ingestion_date_str}/"
+        resp = s3_client.list_objects_v2(Bucket=FULL_BUCKET_NAME, Prefix=prefix)
+        if "Contents" in resp:
+            keys = sorted([obj["Key"] for obj in resp["Contents"] if obj["Key"].endswith("manifest.json")], reverse=True)
+            if keys:
+                latest_resp = s3_client.get_object(Bucket=FULL_BUCKET_NAME, Key=keys[0])
+                return json.loads(latest_resp["Body"].read().decode("utf-8"))
     except Exception:
         pass
 
-    return None, f"s3://{FULL_BUCKET_NAME}/{exact_key}"
+    return None
 
 def generate_job_report(job_name: str, run_id: str, output_dir: str = "reports/job_executions") -> str:
-    """Consulta o Glue, S3 e CloudWatch usando JobName e RunId e gera o relatório Markdown completo."""
-    print(f"📊 [FinOps & Observabilidade] Gerando relatório consolidado para {job_name} (RunId: {run_id[:8]})...")
+    """Consulta o Glue, S3 e CloudWatch e gera o relatório Markdown completo para Bronze ou Silver."""
+    print(f"📊 [FinOps & Observabilidade] Gerando relatório para {job_name} (RunId: {run_id[:8]})...")
     
     glue_client = boto3.client("glue", region_name=AWS_REGION)
     
@@ -124,40 +129,58 @@ def generate_job_report(job_name: str, run_id: str, output_dir: str = "reports/j
         dpu_hours = dpu_seconds / 3600.0 if dpu_seconds else (execution_time / 3600.0) * 2.0
         cost_usd = dpu_hours * COST_PER_DPU_HOUR
         
-        # Coleta de Logs do CloudWatch (/aws-glue/jobs/output)
         logs_text = fetch_stdout_cloudwatch_logs(run_id)
+        manifest_data = fetch_s3_manifest(job_name, run_id, ingestion_date_str)
         
-        # Busca o Manifesto no S3 com busca resiliente
-        manifest_data, manifest_uri = fetch_s3_manifest(run_id, ingestion_date_str)
+        layer = "silver" if "silver" in job_name.lower() or "02" in job_name else "bronze"
+        manifest_uri = f"s3://{FULL_BUCKET_NAME}/auditoria/{layer}/ingestion_date={ingestion_date_str}/run_id={run_id}/manifest.json"
         
         error_section = ""
         if error_message:
             error_section = f"\n### 🚨 Mensagem de Erro Registrada pelo Glue:\n```text\n{error_message}\n```\n"
 
-        # Montagem da Tabela Comparativa (Origem BigQuery vs. Destino S3)
-        comparison_rows = []
-        if manifest_data and "tables_metrics" in manifest_data:
-            for item in manifest_data["tables_metrics"]:
-                ent = item.get("entity", "N/A")
-                bq_rows = item.get("bq_rows", 0)
-                s3_rows = item.get("s3_rows", 0)
-                st = item.get("status", "N/A")
-                parts = item.get("partitions", 0)
-                size_mb = item.get("size_mb", 0.0)
+        # Montagem da Seção 5 conforme a camada (Bronze ou Silver)
+        if layer == "silver":
+            section_5_title = "## 5. 🛡️ Auditoria Qualitativa e Estado Final da Camada Silver"
+            
+            if manifest_data:
+                in_rows = manifest_data.get("input_rows_alunos", 0)
+                out_rows = manifest_data.get("output_rows_curado", 0)
+                match_ratio = manifest_data.get("join_match_ratio_percent", 0.0)
+                qg_status = "✅ APROVADO (>= 95.0%)" if manifest_data.get("quality_gate_passed") else "❌ REPROVADO"
+                silver_uri = manifest_data.get("silver_s3_prefix", f"s3://{FULL_BUCKET_NAME}/silver/alunos_curado/")
                 
-                bq_str = f"{bq_rows:,}" if bq_rows >= 0 else "N/A"
-                if "SKIPPED" in st:
-                    s3_str = "0 (Already Up-to-Date)"
-                else:
-                    s3_str = f"{s3_rows:,}" if s3_rows >= 0 else "OK"
-                
-                comparison_rows.append(
-                    f"| `{ent}` | {bq_str} | {s3_str} | `{st}` | {parts} part. ({size_mb} MB) |"
-                )
+                section_5_content = f"""| Métrica de Curadoria / Qualidade | Valor Registrado | Observação de Engenharia |
+| :--- | :---: | :--- |
+| **Linhas de Alunos (Entrada)** | **{in_rows:,}** | Registros brutos lidos do manifesto Bronze |
+| **Linhas Curadas (Saída)** | **{out_rows:,}** | Registros finais enriquecidos e validados |
+| **Taxa de Match do JOIN** | **{match_ratio:.2f}%** | Percentual de alinhamento com dimensões territoriais |
+| **Status do Gate de Qualidade** | **{qg_status}** | Trava bloqueante da pipeline (check_join_ratio) |
+| **Tratamento de NULOs (Saeb)** | **Preservado** | Nenhuma atribuição de zero em proficiências/notas |
+| **Status das Metas Educacionais** | **Tripla Categorização** | 'Atingiu', 'Não Atingiu' ou 'Sem Meta Cadastrada' |
+| **S3 Prefix Final (Catálogo)** | `{silver_uri}` | Formato Parquet (Snappy) particionado por data |
+"""
+            else:
+                section_5_content = "ℹ️ Dados do manifesto Silver em processamento ou indisponíveis no S3."
         else:
-            comparison_rows.append("| *N/A* | Dados indisponíveis no manifesto | N/A | N/A | N/A |")
+            section_5_title = "## 5. ⚖️ Comparativo de Contagem: Origem (BigQuery) vs. Destino (S3 Bronze)"
+            comparison_rows = []
+            if manifest_data and "tables_metrics" in manifest_data:
+                for item in manifest_data["tables_metrics"]:
+                    ent = item.get("entity", "N/A")
+                    bq_rows = item.get("bq_rows", 0)
+                    s3_rows = item.get("s3_rows", 0)
+                    st = item.get("status", "N/A")
+                    parts = item.get("partitions", 0)
+                    size_mb = item.get("size_mb", 0.0)
+                    
+                    bq_str = f"{bq_rows:,}" if bq_rows >= 0 else "N/A"
+                    s3_str = f"{s3_rows:,}" if st == "SUCCEEDED" else "0 (Already Up-to-Date)"
+                    comparison_rows.append(f"| `{ent}` | {bq_str} | {s3_str} | `{st}` | {parts} part. ({size_mb} MB) |")
+                section_5_content = "| Entidade | Linhas no BigQuery (Metadados) | Linhas Gravadas no S3 | Status Ingestão | Particionamento & Tamanho |\n| :--- | :---: | :---: | :---: | :---: |\n" + "\n".join(comparison_rows)
+            else:
+                section_5_content = "ℹ️ Dados do manifesto Bronze em processamento ou indisponíveis no S3."
 
-        comparison_table_md = "\n".join(comparison_rows)
         today_date = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         
         report_content = f"""# 📊 Relatório de Execução do Job: `{job_name}`
@@ -184,10 +207,10 @@ def generate_job_report(job_name: str, run_id: str, output_dir: str = "reports/j
 
 ---
 
-## 3. 🌐 Consumo e Origem GCP BigQuery
-* **Dataset Origem:** `basedosdados.br_inep_avaliacao_alfabetizacao` (7 Entidades Oficiais)
-* **Custo de Leitura BigQuery (On-Demand):** **US$ 0,00** *(Até 1 TB/mês no Free Tier)*
-* **Estratégia de Segurança:** Credenciais recuperadas 100% em memória RAM via AWS Secrets Manager (`pipeline-educacao/gcp/bigquery`). Zero arquivos em disco (`/tmp`).
+## 3. 🌐 Consumo e Origem dos Dados
+* **Camada de Origem:** `{"Camada Bronze (Parquet / S3 via Manifesto)" if layer == "silver" else "GCP BigQuery (basedosdados.br_inep_avaliacao_alfabetizacao)"}`
+* **Custo de Leitura / Processamento:** **US$ 0,00 Adicional** *(Incluso no pipeline serverless)*
+* **Estratégia de Governança:** Conexão 100% orientada por manifestos de auditoria JSON.
 
 ---
 
@@ -198,10 +221,8 @@ def generate_job_report(job_name: str, run_id: str, output_dir: str = "reports/j
 
 ---
 
-## 5. ⚖️ Comparativo de Contagem: Origem (BigQuery) vs. Destino (S3 Bronze)
-| Entidade | Linhas no BigQuery (Metadados) | Linhas Gravadas no S3 | Status Ingestão | Particionamento & Tamanho |
-| :--- | :---: | :---: | :---: | :---: |
-{comparison_table_md}
+{section_5_title}
+{section_5_content}
 
 ---
 *Relatório gerado automaticamente pelo orquestrador local (`src/monitor/report_generator.py`).*

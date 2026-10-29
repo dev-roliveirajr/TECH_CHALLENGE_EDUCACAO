@@ -211,14 +211,25 @@ def deploy_artifacts_and_jobs():
 
     # Diretório temporário isolado do sistema para download do JAR
     s3_jar_key = f"libs/{LOCAL_JAR_NAME}"
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_jar_path = os.path.join(temp_dir, LOCAL_JAR_NAME)
-        print(f"  └─ ⬇️ Baixando BigQuery JAR para diretório temporário...")
-        urllib.request.urlretrieve(BIGQUERY_JAR_URL, temp_jar_path)
-        
-        s3_client.upload_file(temp_jar_path, S3_BUCKET, s3_jar_key)
-        s3_client.upload_file(temp_jar_path, S3_BUCKET, f"libs/{LOCAL_JAR_NAME}")
-        print(f"  └─ 📦 Upload BigQuery JAR -> s3://{S3_BUCKET}/{s3_jar_key}")
+    jar_exists = False
+    try:
+        s3_client.head_object(Bucket=S3_BUCKET, Key=s3_jar_key)
+        print(f"  └─ ℹ️ BigQuery Spark Connector JAR já existe em 's3://{S3_BUCKET}/{s3_jar_key}'. Download e upload ignorados (SKIPPED).")
+        jar_exists = True
+    except ClientError as e:
+        jar_exists = False
+    except Exception:
+        jar_exists = False
+
+    if not jar_exists:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_jar_path = os.path.join(temp_dir, LOCAL_JAR_NAME)
+            print("  └─ ⬇️ Baixando BigQuery Spark Connector JAR em diretório temporário...")
+            urllib.request.urlretrieve(BIGQUERY_JAR_URL, temp_jar_path)
+            
+            s3_client.upload_file(temp_jar_path, S3_BUCKET, s3_jar_key)
+            s3_client.upload_file(temp_jar_path, S3_BUCKET, f"jars/libs/{LOCAL_JAR_NAME}")
+            print(f"  └─ 📦 Upload BigQuery JAR -> s3://{S3_BUCKET}/{s3_jar_key}")
 
     # 4. Registro / Atualização dos Glue Jobs no Catalog
     print(f"\n⚙️ 3. Registrando / Atualizando Glue Jobs no AWS Catalog...")
@@ -292,7 +303,6 @@ def main():
     print("   📦 Módulos Python e JARs configurados via --additional-python-modules e /libs/")
     print("   🧹 Repositório local 100% limpo (Zero arquivos temporários mantidos)")
     print("=" * 75)
-
 
 if __name__ == "__main__":
     main()

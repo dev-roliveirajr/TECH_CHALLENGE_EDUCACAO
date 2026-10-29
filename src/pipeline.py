@@ -129,7 +129,6 @@ def run_glue_job(job_name: str) -> str:
                 if generate_job_report:
                     try:
                         report_path = generate_job_report(job_name, run_id)
-                        print(f"📄 Relatório FinOps gerado com sucesso: {report_path}\n")
                     except Exception as rep_err:
                         print(f"⚠️ Alerta: Falha ao gerar relatório para {job_name}: {str(rep_err)}\n")
                 
@@ -148,22 +147,22 @@ def main():
     print("=" * 60)
     
     # 1. Execução da Camada Bronze
-    print("\n" + "=" * 60)
-    print("🔄 Inicio da Ingestão de dados para a camada Bronze...")
-    print("=" * 60)
-    status_bronze = run_glue_job("01_bronze_ingestion")
-    if status_bronze != "SUCCEEDED":
-        print("\n🛑 PARADA DE EMERGÊNCIA: Camada Bronze falhou. Interrompendo pipeline.")
-        sys.exit(1)
+#    print("\n" + "=" * 60)
+#    print("🔄 Inicio da Ingestão de dados para a camada Bronze...")
+#    print("=" * 60)
+#    status_bronze = run_glue_job("01_bronze_ingestion")
+#    if status_bronze != "SUCCEEDED":
+#        print("\n🛑 PARADA DE EMERGÊNCIA: Camada Bronze falhou. Interrompendo pipeline.")
+#        sys.exit(1)
         
     # 2. Execução da Camada Silver (Com validações de qualidade e JOINs)
-#    print("\n" + "=" * 60)
-#    print("🔄 Inicio da Qualificação de dados para a camada Silver...")
-#    print("=" * 60)
-#    status_silver = run_glue_job("02_silver_processing")
-#    if status_silver != "SUCCEEDED":
-#        print("\n🛑 PARADA DE EMERGÊNCIA: Camada Silver falhou (validação de qualidade/JOINs). Interrompendo Gold.")
-#        sys.exit(1)
+    print("\n" + "=" * 60)
+    print("🔄 Inicio da Qualificação de dados para a camada Silver...")
+    print("=" * 60)
+    status_silver = run_glue_job("02_silver_processing")
+    if status_silver != "SUCCEEDED":
+        print("\n🛑 PARADA DE EMERGÊNCIA: Camada Silver falhou (validação de qualidade/JOINs). Interrompendo pipeline.")
+        sys.exit(1)
         
     # 3. Execução da Camada Gold (KPIs e Feature Store para IA)
 #    print("\n" + "=" * 60)
