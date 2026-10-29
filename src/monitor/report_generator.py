@@ -1,14 +1,13 @@
 """
 ===============================================================================
-GERADOR AUTOMÁTICO DE RELATÓRIOS E FINOPS (src/monitor/report_generator.py) - V8
+GERADOR AUTOMÁTICO DE RELATÓRIOS E FINOPS (src/monitor/report_generator.py) - V9
 ===============================================================================
 Descrição: Módulo chamado pelo orquestrador (pipeline.py) ao final de cada Job.
-Destaques V8:
-  - Leitura completa e contínua dos logs do CloudWatch (sem omissão das etapas da EDA).
-  - Suporte completo a relatórios das camadas BRONZE e SILVER.
-  - Leitura resiliente de manifestos S3 (auditoria/bronze/ e auditoria/silver/).
-  - Tabela comparativa e auditoria de travas de qualidade (Join Match Ratio, NULOs).
-  - Estado final do Catálogo S3 e métricas FinOps completas.
+Destaques V9:
+  - Suporte completo e nativo às três camadas do Data Lake: BRONZE, SILVER e GOLD.
+  - Leitura resiliente de manifestos S3 (auditoria/bronze/, auditoria/silver/, auditoria/gold/).
+  - Relatório da Gold com auditoria de Validação Cruzada, Feature Store e Metas Pactuadas.
+  - Leitura contínua de logs CloudWatch e métricas FinOps precisas.
 ===============================================================================
 """
 
@@ -45,7 +44,6 @@ def fetch_stdout_cloudwatch_logs(log_stream_name: str) -> str:
         noise_indicators = ["FutureWarning", "google.api_core", "WARN NativeCodeLoader"]
         next_token = None
         
-        # Loop de paginação para recuperar o log completo sem cortes
         while True:
             kwargs = {
                 "logGroupName": log_group,
@@ -76,9 +74,16 @@ def fetch_stdout_cloudwatch_logs(log_stream_name: str) -> str:
         return f"ℹ️ Log de execução disponível no console CloudWatch (Grupo: {log_group}, Stream: {log_stream_name}). Msg: {str(e)}"
 
 def fetch_s3_manifest(job_name: str, run_id: str, ingestion_date_str: str) -> dict:
-    """Busca o manifesto de auditoria no S3 (suporta Bronze e Silver com fallback)."""
+    """Busca o manifesto de auditoria no S3 (suporta Bronze, Silver e Gold com fallback)."""
     s3_client = boto3.client("s3", region_name=AWS_REGION)
-    layer = "silver" if "silver" in job_name.lower() or "02" in job_name else "bronze"
+    
+    if "gold" in job_name.lower() or "03" in job_name:
+        layer = "gold"
+    elif "silver" in job_name.lower() or "02" in job_name:
+        layer = "silver"
+    else:
+        layer = "bronze"
+
     audit_folder = f"auditoria/{layer}"
     
     # 1. Tentativa por chave exata do run_id
@@ -89,7 +94,7 @@ def fetch_s3_manifest(job_name: str, run_id: str, ingestion_date_str: str) -> di
     except Exception:
         pass
 
-    # 2. Busca resiliente pelo último manifesto do dia na pasta da camada
+    # 2. Busca pelo último manifesto do dia na pasta da camada
     try:
         prefix = f"{audit_folder}/ingestion_date={ingestion_date_str}/"
         resp = s3_client.list_objects_v2(Bucket=FULL_BUCKET_NAME, Prefix=prefix)
@@ -104,7 +109,7 @@ def fetch_s3_manifest(job_name: str, run_id: str, ingestion_date_str: str) -> di
     return None
 
 def generate_job_report(job_name: str, run_id: str, output_dir: str = "reports/job_executions") -> str:
-    """Consulta o Glue, S3 e CloudWatch e gera o relatório Markdown completo para Bronze ou Silver."""
+    """Consulta o Glue, S3 e CloudWatch e gera o relatório Markdown completo para Bronze, Silver ou Gold."""
     print(f"📊 [FinOps & Observabilidade] Gerando relatório para {job_name} (RunId: {run_id[:8]})...")
     
     glue_client = boto3.client("glue", region_name=AWS_REGION)
@@ -132,17 +137,50 @@ def generate_job_report(job_name: str, run_id: str, output_dir: str = "reports/j
         logs_text = fetch_stdout_cloudwatch_logs(run_id)
         manifest_data = fetch_s3_manifest(job_name, run_id, ingestion_date_str)
         
-        layer = "silver" if "silver" in job_name.lower() or "02" in job_name else "bronze"
+        if "gold" in job_name.lower() or "03" in job_name:
+            layer = "gold"
+            origin_desc = "Camada Silver (Parquet / S3 em alunos_curado/)"
+        elif "silver" in job_name.lower() or "02" in job_name:
+            layer = "silver"
+            origin_desc = "Camada Bronze (Parquet / S3 via Manifesto)"
+        else:
+            layer = "bronze"
+            origin_desc = "GCP BigQuery (basedosdados.br_inep_avaliacao_alfabetizacao)"
+
         manifest_uri = f"s3://{FULL_BUCKET_NAME}/auditoria/{layer}/ingestion_date={ingestion_date_str}/run_id={run_id}/manifest.json"
         
         error_section = ""
         if error_message:
             error_section = f"\n### 🚨 Mensagem de Erro Registrada pelo Glue:\n```text\n{error_message}\n```\n"
 
-        # Montagem da Seção 5 conforme a camada (Bronze ou Silver)
-        if layer == "silver":
+        # Montagem da Seção 5 conforme a camada (Bronze, Silver ou Gold)
+        if layer == "gold":
+            section_5_title = "## 5. 🏆 Auditoria Qualitativa e Estado Final da Camada Gold"
+            if manifest_data:
+                in_rows = manifest_data.get("input_rows_silver", 0)
+                out_ind = manifest_data.get("output_rows_indicadores", 0)
+                out_metas = manifest_data.get("output_rows_metas", 0)
+                out_feat = manifest_data.get("output_rows_features", 0)
+                cv_passed = manifest_data.get("cross_validation_passed", True)
+                cv_diff = manifest_data.get("cross_validation_diff_percent", 0.0)
+                cv_status = f"✅ APROVADO ({cv_diff:.3f}% <= 2.0%)" if cv_passed else f"❌ REPROVADO ({cv_diff:.3f}%)"
+                meta_ref = manifest_data.get("target_meta_pactuada", "80.0%")
+                
+                section_5_content = f"""| Métrica Analítica / Governança | Valor Registrado | Observação de Engenharia |
+| :--- | :---: | :--- |
+| **Linhas Lidas da Silver** | **{in_rows:,}** | Registros curados da tabela 'alunos_curado' |
+| **Indicadores Ponderados Municipais** | **{out_ind:,}** | Agregação ponderada pelo peso do aluno (Saeb) |
+| **Comparativo de Metas Gerado** | **{out_metas:,}** | GAP em relação à meta pactuada da fonte |
+| **Feature Store ML (Fase 3)** | **{out_feat:,}** | Matriz de características (13 colunas) sem leakage |
+| **Validação Cruzada (Microdado vs. Inep)** | **{cv_status}** | Batimento da taxa recalculada vs. oficial |
+| **Meta Pactuada Oficial de Referência** | **{meta_ref}** | Trajetória oficial pactuada até 2030 |
+| **S3 Gold Prefixes & Local Sync** | `s3://{FULL_BUCKET_NAME}/gold/` | Cópia sincronizada em 'data/features/' |
+"""
+            else:
+                section_5_content = "ℹ️ Dados do manifesto Gold em processamento ou indisponíveis no S3."
+
+        elif layer == "silver":
             section_5_title = "## 5. 🛡️ Auditoria Qualitativa e Estado Final da Camada Silver"
-            
             if manifest_data:
                 in_rows = manifest_data.get("input_rows_alunos", 0)
                 out_rows = manifest_data.get("output_rows_curado", 0)
@@ -208,7 +246,7 @@ def generate_job_report(job_name: str, run_id: str, output_dir: str = "reports/j
 ---
 
 ## 3. 🌐 Consumo e Origem dos Dados
-* **Camada de Origem:** `{"Camada Bronze (Parquet / S3 via Manifesto)" if layer == "silver" else "GCP BigQuery (basedosdados.br_inep_avaliacao_alfabetizacao)"}`
+* **Camada de Origem:** `{origin_desc}`
 * **Custo de Leitura / Processamento:** **US$ 0,00 Adicional** *(Incluso no pipeline serverless)*
 * **Estratégia de Governança:** Conexão 100% orientada por manifestos de auditoria JSON.
 

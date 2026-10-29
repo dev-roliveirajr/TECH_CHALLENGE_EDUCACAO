@@ -11,8 +11,11 @@ polling e aplica travas de fallback (interrompe o fluxo em caso de falha).
 import os
 import sys
 import time
+import shutil
+import tempfile
 import datetime
 import boto3
+import pandas as pd
 from dotenv import load_dotenv
 from monitor.report_generator import generate_job_report
 
@@ -20,7 +23,11 @@ from monitor.report_generator import generate_job_report
 # Carrega variáveis de ambiente do .env
 load_dotenv(override=True)
 
-AWS_REGION = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+AWS_REGION = os.getenv("AWS_DEFAULT_REGION")
+AWS_ACCOUNT_ID = os.getenv("AWS_ACCOUNT_ID")
+S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
+
+FULL_BUCKET_NAME = f"{S3_BUCKET_NAME}-{AWS_ACCOUNT_ID}-{AWS_REGION}"
 POLLING_INTERVAL_SECONDS = int(os.getenv("GLUE_POLLING_INTERVAL", "10"))
 
 def get_glue_client():
@@ -30,6 +37,71 @@ def get_glue_client():
 def get_logs_client():
     """Inicializa o cliente boto3 do AWS CloudWatch Logs."""
     return boto3.client("logs", region_name=AWS_REGION)
+
+def get_s3_client():
+    """Inicializa o cliente boto3 do AWS S3."""
+    return boto3.client("s3", region_name=AWS_REGION)
+def sync_gold_features_locally():
+    """
+    Sincroniza e consolida os datasets Parquet da Camada Gold do S3 para a pasta local
+    'data/features/', unificando as partições dispersas em arquivos .parquet únicos:
+      - data/features/gold_features_alfabetizacao.parquet
+      - data/features/gold_indicadores_municipais.parquet
+      - data/features/gold_desempenho_vs_metas.parquet
+    """
+    print("\n--------------------------------------------------")
+    print("🔄 Sincronizando e consolidando datasets Gold localmente em 'data/features/'...")
+    print("--------------------------------------------------")
+    
+    s3_client = get_s3_client()
+    local_output_dir = os.path.join(os.getcwd(), "data", "features")
+    os.makedirs(local_output_dir, exist_ok=True)
+
+    gold_datasets = {
+        "gold_features_alfabetizacao": "gold/gold_features_alfabetizacao/",
+        "gold_indicadores_municipais": "gold/gold_indicadores_municipais/",
+        "gold_desempenho_vs_metas": "gold/gold_desempenho_vs_metas/"
+    }
+
+    for dataset_name, s3_prefix in gold_datasets.items():
+        temp_dir = tempfile.mkdtemp()
+        try:
+            resp = s3_client.list_objects_v2(Bucket=FULL_BUCKET_NAME, Prefix=s3_prefix)
+            if "Contents" not in resp:
+                print(f"⚠️ Aviso: Prefixo {s3_prefix} não encontrado no S3.")
+                continue
+
+            parquet_keys = [
+                obj["Key"] for obj in resp["Contents"] 
+                if obj["Key"].endswith(".parquet") and not obj["Key"].split("/")[-1].startswith(".")
+            ]
+
+            if not parquet_keys:
+                print(f"⚠️ Aviso: Nenhum arquivo Parquet encontrado em {s3_prefix}.")
+                continue
+
+            # Baixa as partes do S3 para o diretório temporário
+            downloaded_files = []
+            for i, key in enumerate(parquet_keys):
+                local_tmp_file = os.path.join(temp_dir, f"part_{i}.parquet")
+                s3_client.download_file(FULL_BUCKET_NAME, key, local_tmp_file)
+                downloaded_files.append(local_tmp_file)
+
+            # Consolidando arquivos usando Pandas
+            dfs = [pd.read_parquet(f) for f in downloaded_files]
+            df_consolidated = pd.concat(dfs, ignore_index=True)
+
+            # Salvando como arquivo único .parquet
+            target_file_path = os.path.join(local_output_dir, f"{dataset_name}.parquet")
+            df_consolidated.to_parquet(target_file_path, index=False)
+            print(f"  └─ ✅ Dataset consolidado salvo com sucesso: {target_file_path} ({len(df_consolidated):,} linhas)")
+
+        except Exception as e:
+            print(f"⚠️ Alerta: Falha ao sincronizar {dataset_name}: {str(e)}")
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    print("--------------------------------------------------\n")
 
 def run_glue_job(job_name: str) -> str:
     """
@@ -123,12 +195,13 @@ def run_glue_job(job_name: str) -> str:
                     print(f"   Detalhes: {error_message}")
 
                 print(f"📊 Duração: {execution_time}s | DPU-Segundos: {dpu_seconds}")
-                print(f"--------------------------------------------------")
+                print(f"--------------------------------------------------")              
                 
                 # Invoca a geração do Relatório FinOps e Observabilidade (.md)
                 if generate_job_report:
                     try:
                         report_path = generate_job_report(job_name, run_id)
+                        print(f"📄 Relatório FinOps gerado com sucesso: {report_path}\n")
                     except Exception as rep_err:
                         print(f"⚠️ Alerta: Falha ao gerar relatório para {job_name}: {str(rep_err)}\n")
                 
@@ -156,23 +229,25 @@ def main():
 #        sys.exit(1)
         
     # 2. Execução da Camada Silver (Com validações de qualidade e JOINs)
-    print("\n" + "=" * 60)
-    print("🔄 Inicio da Qualificação de dados para a camada Silver...")
-    print("=" * 60)
-    status_silver = run_glue_job("02_silver_processing")
-    if status_silver != "SUCCEEDED":
-        print("\n🛑 PARADA DE EMERGÊNCIA: Camada Silver falhou (validação de qualidade/JOINs). Interrompendo pipeline.")
-        sys.exit(1)
-        
-    # 3. Execução da Camada Gold (KPIs e Feature Store para IA)
 #    print("\n" + "=" * 60)
-#    print("🔄 Inicio da Agregação de dados para a camada Gold...")
+#    print("🔄 Inicio da Qualificação de dados para a camada Silver...")
 #    print("=" * 60)
-#    status_gold = run_glue_job("03_gold_aggregation")
-#    if status_gold != "SUCCEEDED":
-#        print("\n🛑 ALERTA: Camada Gold falhou.")
+#    status_silver = run_glue_job("02_silver_processing")
+#    if status_silver != "SUCCEEDED":
+#        print("\n🛑 PARADA DE EMERGÊNCIA: Camada Silver falhou (validação de qualidade/JOINs). Interrompendo pipeline.")
 #        sys.exit(1)
         
+    # 3. Execução da Camada Gold (KPIs e Feature Store para IA)
+    print("\n" + "=" * 60)
+    print("🔄 Inicio da Agregação de dados para a camada Gold...")
+    print("=" * 60)
+    status_gold = run_glue_job("03_gold_aggregation")
+    if status_gold != "SUCCEEDED":
+        print("\n🛑 ALERTA: Camada Gold falhou.")
+        sys.exit(1)
+
+    # 4. Sincronização e consolidação local dos datasets da Gold em 'data/features/'
+    sync_gold_features_locally()        
     print("\n" + "=" * 60)
     print("🎉 PIPELINE EXECUTADA COM SUCESSO EM TODAS AS CAMADAS!")
     print("=" * 60)

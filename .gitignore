@@ -170,6 +170,9 @@ venv.bak/
 # mkdocs/Zensical documentation
 /site
 
+# reports/job_executions
+#reports/
+
 # mypy
 .mypy_cache/
 .dmypy.json

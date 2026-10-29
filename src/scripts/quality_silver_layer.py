@@ -176,7 +176,7 @@ for name in tables_key_duplicate:
 
 # 4. Limpeza, Padronização e Eliminação de Colisão de Métricas
 print("\n" + "#" * 75)
-print("\n🧹 4. Executando Limpeza, Padronização e Eliminação de Colisão de Métricas...")
+print("🧹 4. Executando Limpeza, Padronização e Eliminação de Colisão de Métricas...")
 print("#" * 75 + "\n")
 
 df_alunos = tables["alunos"]
@@ -252,7 +252,7 @@ for old_c, new_c in meta_cols_rename.items():
 
 # 5. Executando O GRANDE JOIN Relacional
 print("\n" + "#" * 75)
-print("\n🔗 5. Executando O GRANDE JOIN Relacional (Sem Explosão nem Ambiguidade)...")
+print("🔗 5. Executando O GRANDE JOIN Relacional (Sem Explosão nem Ambiguidade)...")
 print("#" * 75 + "\n")
 
 # JOIN 1: Alunos + Municipio
@@ -278,7 +278,7 @@ df_joined = df_joined.join(
 
 # 6. Validando Gate de Qualidade
 print("\n" + "#" * 75)
-print("\n🛡️ 6. Validando Gate de Qualidade (check_join_ratio)...")
+print("🛡️ 6. Validando Gate de Qualidade (check_join_ratio)...")
 print("#" * 75 + "\n")
 
 match_ratio, metrics = check_join_ratio(
@@ -303,7 +303,7 @@ df_joined = df_joined.withColumn("_processed_silver_at", F.current_timestamp())
 
 # 7. Gravação no S3
 print("\n" + "#" * 75)
-print(f"\n💾 7. Gravando no S3")
+print("💾 7. Gravando no S3")
 print("#" * 75 + "\n")
 
 output_path = f"{SILVER_PATH}alunos_curado/"
