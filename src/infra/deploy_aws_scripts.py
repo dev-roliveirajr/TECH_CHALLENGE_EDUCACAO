@@ -18,7 +18,6 @@ Destaques:
 """
 
 import os
-import sys
 import urllib.request
 import tempfile
 import boto3
@@ -49,7 +48,9 @@ else:
     GLUE_ROLE_ARN = raw_glue_role
 
 # Nome do Secret Manager & Chave Local GCP
-SECRET_NAME = os.getenv("GCP_BIGQUERY_KEY_SECRET_NAME", "pipeline-educacao/gcp/bigquery")
+SECRET_NAME = os.getenv(
+    "GCP_BIGQUERY_KEY_SECRET_NAME", "pipeline-educacao/gcp/bigquery"
+)
 GCP_KEY_LOCAL = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "gcp_key.json")
 
 if not S3_BUCKET:
@@ -61,19 +62,36 @@ glue_client = boto3.client("glue", region_name=AWS_REGION)
 sm_client = boto3.client("secretsmanager", region_name=AWS_REGION)
 
 SCRIPTS_TO_DEPLOY = [
-    {"local": "src/scripts/ingestion_bronze_layer.py", "s3_key": "scripts/ingestion_bronze_layer.py", "job_name": "01_bronze_ingestion"},
-    {"local": "src/scripts/quality_silver_layer.py", "s3_key": "scripts/quality_silver_layer.py", "job_name": "02_silver_processing"},
-    {"local": "src/scripts/aggregate_gold_layer.py", "s3_key": "scripts/aggregate_gold_layer.py", "job_name": "03_gold_aggregation"},
-    {"local": "src/common/quality_lib.py", "s3_key": "scripts/common/quality_lib.py", "job_name": None}
+    {
+        "local": "src/scripts/ingestion_bronze_layer.py",
+        "s3_key": "scripts/ingestion_bronze_layer.py",
+        "job_name": "01_bronze_ingestion",
+    },
+    {
+        "local": "src/scripts/quality_silver_layer.py",
+        "s3_key": "scripts/quality_silver_layer.py",
+        "job_name": "02_silver_processing",
+    },
+    {
+        "local": "src/scripts/aggregate_gold_layer.py",
+        "s3_key": "scripts/aggregate_gold_layer.py",
+        "job_name": "03_gold_aggregation",
+    },
+    {
+        "local": "src/common/quality_lib.py",
+        "s3_key": "scripts/common/quality_lib.py",
+        "job_name": None,
+    },
 ]
 
 BIGQUERY_JAR_URL = "https://repo1.maven.org/maven2/com/google/cloud/spark/spark-bigquery-with-dependencies_2.12/0.34.0/spark-bigquery-with-dependencies_2.12-0.34.0.jar"
 LOCAL_JAR_NAME = "spark-bigquery-with-dependencies_2.12-0.34.0.jar"
 
+
 def setup_gcp_secret():
     """1. Cria ou atualiza o valor da Secret no AWS Secrets Manager."""
     print(f"🔐 1. Gerenciando Secret no AWS Secrets Manager ('{SECRET_NAME}')...")
-    
+
     gcp_key_file = GCP_KEY_LOCAL
     if not os.path.exists(gcp_key_file):
         for alt_key in ["gcp-key.json", "gcp_key.json"]:
@@ -82,7 +100,9 @@ def setup_gcp_secret():
                 break
 
     if not os.path.exists(gcp_key_file):
-        print(f"  └─ ⚠️ Chave local '{gcp_key_file}' não encontrada. Pulando provisionamento da Secret.")
+        print(
+            f"  └─ ⚠️ Chave local '{gcp_key_file}' não encontrada. Pulando provisionamento da Secret."
+        )
         return
 
     with open(gcp_key_file, "r", encoding="utf-8") as f:
@@ -92,20 +112,90 @@ def setup_gcp_secret():
         sm_client.create_secret(
             Name=SECRET_NAME,
             Description="Chave de Service Account do GCP para acesso ao BigQuery",
-            SecretString=secret_content
+            SecretString=secret_content,
         )
         print(f"  └─ ✅ Secret criada com sucesso: '{SECRET_NAME}'")
     except sm_client.exceptions.ResourceExistsException:
         try:
             sm_client.put_secret_value(
-                SecretId=SECRET_NAME,
-                SecretString=secret_content
+                SecretId=SECRET_NAME, SecretString=secret_content
             )
             print(f"  └─ 🔄 Secret atualizada com sucesso: '{SECRET_NAME}'")
         except Exception as put_err:
             print(f"  └─ ⚠️ Erro ao atualizar Secret existente: {put_err}")
     except Exception as e:
         print(f"  └─ ⚠️ Erro ao gerenciar Secret: {str(e)}")
+
+
+def _bucket_is_available():
+    try:
+        s3_client.head_bucket(Bucket=S3_BUCKET)
+        print(f"  └─ ✅ Bucket S3 existente e acessível: '{S3_BUCKET}'")
+        return True
+    except ClientError as error:
+        error_code = str(error.response.get("Error", {}).get("Code", ""))
+        if error_code in ["403", "AccessDenied", "Forbidden"]:
+            print(
+                f"  └─ ⚠️ Alerta de permissão (403/SCP Vocareum): O bucket '{S3_BUCKET}' já existe e será reutilizado."
+            )
+            return True
+        if error_code in ["404", "NoSuchBucket", "NotFound"]:
+            print(
+                f"  └─ 🆕 Bucket '{S3_BUCKET}' não encontrado. Criando novo bucket..."
+            )
+            return False
+        print(
+            f"  └─ ℹ️ Aviso ao checar bucket ({error_code}). Assumindo que o bucket já existe."
+        )
+        return True
+    except Exception as exc:
+        print(f"  └─ ℹ️ Exceção ao checar bucket: {exc}. Assumindo bucket existente.")
+        return True
+
+
+def _configure_bucket_security():
+    try:
+        s3_client.put_bucket_ownership_controls(
+            Bucket=S3_BUCKET,
+            OwnershipControls={"Rules": [{"ObjectOwnership": "BucketOwnerEnforced"}]},
+        )
+        print("     ├─ 🔒 Object Ownership: ACLs disabled (BucketOwnerEnforced).")
+    except Exception as error:
+        print(f"     ├─ ⚠️ Aviso em Object Ownership: {str(error)}")
+
+    try:
+        s3_client.put_public_access_block(
+            Bucket=S3_BUCKET,
+            PublicAccessBlockConfiguration={
+                "BlockPublicAcls": True,
+                "IgnorePublicAcls": True,
+                "BlockPublicPolicy": True,
+                "RestrictPublicBuckets": True,
+            },
+        )
+        print("     ├─ 🛡️ Block Public Access: Habilitado (Block all public access).")
+    except Exception as error:
+        print(f"     ├─ ⚠️ Aviso em Block Public Access: {str(error)}")
+
+    try:
+        s3_client.put_bucket_encryption(
+            Bucket=S3_BUCKET,
+            ServerSideEncryptionConfiguration={
+                "Rules": [
+                    {
+                        "ApplyServerSideEncryptionByDefault": {
+                            "SSEAlgorithm": "AES256"
+                        },
+                        "BucketKeyEnabled": True,
+                    }
+                ]
+            },
+        )
+        print(
+            "     └─ 🔑 Criptografia Recomendada (SSE-S3 / AES256 com Bucket Key Enabled) configurada com sucesso!"
+        )
+    except Exception as error:
+        print(f"     └─ ⚠️ Aviso em Criptografia: {str(error)}")
 
 
 def prepare_and_create_s3_bucket():
@@ -120,81 +210,85 @@ def prepare_and_create_s3_bucket():
        - Criptografia padrão: SSE-S3 (AES256) com Bucket Key ativado
     """
     print(f"\n🪣 2. Verificando/Criando Bucket S3 ('s3://{S3_BUCKET}')...")
-    
-    bucket_exists = False
+
+    if _bucket_is_available():
+        return
+
     try:
-        s3_client.head_bucket(Bucket=S3_BUCKET)
-        print(f"  └─ ✅ Bucket S3 existente e acessível: '{S3_BUCKET}'")
-        bucket_exists = True
-    except ClientError as e:
-        error_code = str(e.response.get("Error", {}).get("Code", ""))
-        if error_code in ["403", "AccessDenied", "Forbidden"]:
-            print(f"  └─ ⚠️ Alerta de permissão (403/SCP Vocareum): O bucket '{S3_BUCKET}' já existe e será reutilizado.")
-            bucket_exists = True
-        elif error_code in ["404", "NoSuchBucket", "NotFound"]:
-            print(f"  └─ 🆕 Bucket '{S3_BUCKET}' não encontrado. Criando novo bucket...")
-            bucket_exists = False
+        if AWS_REGION == "us-east-1":
+            s3_client.create_bucket(Bucket=S3_BUCKET)
         else:
-            print(f"  └─ ℹ️ Aviso ao checar bucket ({error_code}). Assumindo que o bucket já existe.")
-            bucket_exists = True
-    except Exception as exc:
-        print(f"  └─ ℹ️ Exceção ao checar bucket: {exc}. Assumindo bucket existente.")
-        bucket_exists = True
+            s3_client.create_bucket(
+                Bucket=S3_BUCKET,
+                CreateBucketConfiguration={"LocationConstraint": AWS_REGION},
+            )
+        print(f"     ├─ 🪣 Bucket criado no namespace Account Regional ({AWS_REGION}).")
+    except Exception as create_err:
+        raise ValueError(
+            f"❌ Falha ao criar/configurar o bucket S3 '{S3_BUCKET}': {str(create_err)}"
+        )
 
-    if not bucket_exists:
-        try:
-            # 2.1 Criação do Bucket
-            if AWS_REGION == "us-east-1":
-                s3_client.create_bucket(Bucket=S3_BUCKET)
-            else:
-                s3_client.create_bucket(
-                    Bucket=S3_BUCKET,
-                    CreateBucketConfiguration={'LocationConstraint': AWS_REGION}
-                )
-            print(f"     ├─ 🪣 Bucket criado no namespace Account Regional ({AWS_REGION}).")
+    _configure_bucket_security()
 
-            # 2.2 Object Ownership: ACLs disabled (BucketOwnerEnforced)
-            try:
-                s3_client.put_bucket_ownership_controls(
-                    Bucket=S3_BUCKET,
-                    OwnershipControls={'Rules': [{'ObjectOwnership': 'BucketOwnerEnforced'}]}
-                )
-                print("     ├─ 🔒 Object Ownership: ACLs disabled (BucketOwnerEnforced).")
-            except Exception as e:
-                print(f"     ├─ ⚠️ Aviso em Object Ownership: {str(e)}")
 
-            # 2.3 Block Public Access Settings: Block all public access
-            try:
-                s3_client.put_public_access_block(
-                    Bucket=S3_BUCKET,
-                    PublicAccessBlockConfiguration={
-                        'BlockPublicAcls': True,
-                        'IgnorePublicAcls': True,
-                        'BlockPublicPolicy': True,
-                        'RestrictPublicBuckets': True
-                    }
-                )
-                print("     ├─ 🛡️ Block Public Access: Habilitado (Block all public access).")
-            except Exception as e:
-                print(f"     ├─ ⚠️ Aviso em Block Public Access: {str(e)}")
+def _upload_connector_jar(s3_jar_key):
+    try:
+        s3_client.head_object(Bucket=S3_BUCKET, Key=s3_jar_key)
+        print(
+            f"  └─ ℹ️ BigQuery Spark Connector JAR já existe em 's3://{S3_BUCKET}/{s3_jar_key}'. Download e upload ignorados (SKIPPED)."
+        )
+        return
+    except Exception:
+        pass
 
-            # 2.4 Criptografia de Servidor Recomendada (SSE-S3 AES256 com Bucket Key Enabled)
-            try:
-                s3_client.put_bucket_encryption(
-                    Bucket=S3_BUCKET,
-                    ServerSideEncryptionConfiguration={
-                        'Rules': [{
-                            'ApplyServerSideEncryptionByDefault': {'SSEAlgorithm': 'AES256'},
-                            'BucketKeyEnabled': True
-                        }]
-                    }
-                )
-                print("     └─ 🔑 Criptografia Recomendada (SSE-S3 / AES256 com Bucket Key Enabled) configurada com sucesso!")
-            except Exception as e:
-                print(f"     └─ ⚠️ Aviso em Criptografia: {str(e)}")
-        except Exception as create_err:
-            raise ValueError(f"❌ Falha ao criar/configurar o bucket S3 '{S3_BUCKET}': {str(create_err)}")
-            
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_jar_path = os.path.join(temp_dir, LOCAL_JAR_NAME)
+        print(
+            "  └─ ⬇️ Baixando BigQuery Spark Connector JAR em diretório temporário..."
+        )
+        urllib.request.urlretrieve(BIGQUERY_JAR_URL, temp_jar_path)
+        s3_client.upload_file(temp_jar_path, S3_BUCKET, s3_jar_key)
+        s3_client.upload_file(temp_jar_path, S3_BUCKET, f"jars/libs/{LOCAL_JAR_NAME}")
+        print(f"  └─ 📦 Upload BigQuery JAR -> s3://{S3_BUCKET}/{s3_jar_key}")
+
+
+def _register_glue_job(item, extra_py_files, extra_jars, additional_modules):
+    job_name = item["job_name"]
+    script_s3_path = f"s3://{S3_BUCKET}/{item['s3_key']}"
+    job_params = {
+        "Role": GLUE_ROLE_ARN,
+        "Command": {
+            "Name": "glueetl",
+            "ScriptLocation": script_s3_path,
+            "PythonVersion": "3",
+        },
+        "DefaultArguments": {
+            "--job-language": "python",
+            "--extra-py-files": extra_py_files,
+            "--extra-jars": extra_jars,
+            "--additional-python-modules": additional_modules,
+            "--S3_BUCKET_NAME": S3_BUCKET,
+            "--TempDir": f"s3://{S3_BUCKET}/temp/",
+            "--enable-metrics": "true",
+            "--enable-continuous-cloudwatch-log": "true",
+        },
+        "GlueVersion": "4.0",
+        "NumberOfWorkers": 2,
+        "WorkerType": "G.1X",
+        "MaxRetries": 0,
+    }
+
+    try:
+        glue_client.get_job(JobName=job_name)
+        print(f"  └─ 🔄 Atualizando Glue Job existente: {job_name}")
+        glue_client.update_job(JobName=job_name, JobUpdate=job_params)
+    except glue_client.exceptions.EntityNotFoundException:
+        print(f"  └─ 🆕 Criando novo Glue Job: {job_name}")
+        glue_client.create_job(Name=job_name, **job_params)
+    except Exception as job_err:
+        print(f"  └─ ⚠️ Erro ao registrar/atualizar Glue Job {job_name}: {job_err}")
+
+
 def deploy_artifacts_and_jobs():
     """2 & 3. Empacota artefatos no S3 e registra Glue Jobs com --additional-python-modules."""
     print(f"\n📤 2. Processando artefatos e enviando para s3://{S3_BUCKET}/...")
@@ -209,78 +303,22 @@ def deploy_artifacts_and_jobs():
         else:
             print(f"  └─ ⚠️ Arquivo local não encontrado: {local_path}")
 
-    # Diretório temporário isolado do sistema para download do JAR
     s3_jar_key = f"libs/{LOCAL_JAR_NAME}"
-    jar_exists = False
-    try:
-        s3_client.head_object(Bucket=S3_BUCKET, Key=s3_jar_key)
-        print(f"  └─ ℹ️ BigQuery Spark Connector JAR já existe em 's3://{S3_BUCKET}/{s3_jar_key}'. Download e upload ignorados (SKIPPED).")
-        jar_exists = True
-    except ClientError as e:
-        jar_exists = False
-    except Exception:
-        jar_exists = False
-
-    if not jar_exists:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_jar_path = os.path.join(temp_dir, LOCAL_JAR_NAME)
-            print("  └─ ⬇️ Baixando BigQuery Spark Connector JAR em diretório temporário...")
-            urllib.request.urlretrieve(BIGQUERY_JAR_URL, temp_jar_path)
-            
-            s3_client.upload_file(temp_jar_path, S3_BUCKET, s3_jar_key)
-            s3_client.upload_file(temp_jar_path, S3_BUCKET, f"jars/libs/{LOCAL_JAR_NAME}")
-            print(f"  └─ 📦 Upload BigQuery JAR -> s3://{S3_BUCKET}/{s3_jar_key}")
+    _upload_connector_jar(s3_jar_key)
 
     # 4. Registro / Atualização dos Glue Jobs no Catalog
-    print(f"\n⚙️ 3. Registrando / Atualizando Glue Jobs no AWS Catalog...")
-    
+    print("\n⚙️ 3. Registrando / Atualizando Glue Jobs no AWS Catalog...")
+
     extra_py_files = f"s3://{S3_BUCKET}/scripts/common/quality_lib.py"
     extra_jars = f"s3://{S3_BUCKET}/{s3_jar_key}"
-    additional_modules = "google-cloud-bigquery==3.11.0,google-auth==2.22.0,urllib3<2.0.0,python-dotenv"
+    additional_modules = (
+        "google-cloud-bigquery==3.11.0,google-auth==2.22.0,urllib3<2.0.0,python-dotenv"
+    )
 
     for item in SCRIPTS_TO_DEPLOY:
-        job_name = item["job_name"]
-        if not job_name:
-            continue
-            
-        script_s3_path = f"s3://{S3_BUCKET}/{item['s3_key']}"
-        
-        job_command = {
-            'Name': 'glueetl',
-            'ScriptLocation': script_s3_path,
-            'PythonVersion': '3'
-        }
-        
-        default_args = {
-            '--job-language': 'python',
-            '--extra-py-files': extra_py_files,
-            '--extra-jars': extra_jars,
-            '--additional-python-modules': additional_modules,
-            '--S3_BUCKET_NAME': S3_BUCKET,
-            '--TempDir': f"s3://{S3_BUCKET}/temp/",
-            '--enable-metrics': 'true',
-            '--enable-continuous-cloudwatch-log': 'true'
-        }
-        
-        job_params = {
-            'Role': GLUE_ROLE_ARN,
-            'Command': job_command,
-            'DefaultArguments': default_args,
-            'GlueVersion': '4.0',
-            'NumberOfWorkers': 2,
-            'WorkerType': 'G.1X',
-            'MaxRetries': 0
-        }
-        
-        try:
-            glue_client.get_job(JobName=job_name)
-            print(f"  └─ 🔄 Atualizando Glue Job existente: {job_name}")
-            glue_client.update_job(JobName=job_name, JobUpdate=job_params)
-        except glue_client.exceptions.EntityNotFoundException:
-            print(f"  └─ 🆕 Criando novo Glue Job: {job_name}")
-            glue_client.create_job(Name=job_name, **job_params)
-        except Exception as job_err:
-            print(f"  └─ ⚠️ Erro ao registrar/atualizar Glue Job {job_name}: {job_err}")           
+        if item["job_name"]:
+            _register_glue_job(item, extra_py_files, extra_jars, additional_modules)
+
 
 def main():
     print("=" * 75)
@@ -291,18 +329,21 @@ def main():
     print(f"ℹ️ Bucket S3 Alvo: s3://{S3_BUCKET}")
     print(f"ℹ️ Role Glue ARN: {GLUE_ROLE_ARN}")
     print("-" * 75)
-    
+
     setup_gcp_secret()
     prepare_and_create_s3_bucket()
     deploy_artifacts_and_jobs()
-    
+
     print("\n" + "=" * 75)
     print("✅ DEPLOY CONCLUÍDO COM SUCESSO!")
     print(f"   🔒 Secret no Secrets Manager: '{SECRET_NAME}'")
     print(f"   🪣 Bucket S3 verificado/criado com segurança: 's3://{S3_BUCKET}'")
-    print("   📦 Módulos Python e JARs configurados via --additional-python-modules e /libs/")
+    print(
+        "   📦 Módulos Python e JARs configurados via --additional-python-modules e /libs/"
+    )
     print("   🧹 Repositório local 100% limpo (Zero arquivos temporários mantidos)")
     print("=" * 75)
+
 
 if __name__ == "__main__":
     main()

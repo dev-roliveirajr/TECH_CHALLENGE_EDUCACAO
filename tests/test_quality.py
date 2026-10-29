@@ -18,6 +18,7 @@ from unittest.mock import MagicMock
 # Tentativa de importação de módulos PySpark (com fallback gracioso para mocks)
 try:
     from pyspark.sql import SparkSession
+
     PYSPARK_AVAILABLE = True
 except ImportError:
     PYSPARK_AVAILABLE = False
@@ -30,20 +31,27 @@ except ImportError:
 def spark_session():
     """Cria uma sessão local leve do Spark para testes unitários em memória."""
     if not PYSPARK_AVAILABLE:
-        pytest.skip("PySpark não está instalado no ambiente local. Ignorando testes com Spark local.")
+        pytest.skip(
+            "PySpark não está instalado no ambiente local. Ignorando testes com Spark local."
+        )
 
     java_home = os.environ.get("JAVA_HOME")
     java_from_home = Path(java_home, "bin", "java") if java_home else None
     if not shutil.which("java") and not (
-        java_from_home and java_from_home.is_file() and os.access(java_from_home, os.X_OK)
+        java_from_home
+        and java_from_home.is_file()
+        and os.access(java_from_home, os.X_OK)
     ):
-        pytest.skip("Java não está instalado ou configurado. Ignorando testes com Spark local.")
+        pytest.skip(
+            "Java não está instalado ou configurado. Ignorando testes com Spark local."
+        )
 
-    spark = SparkSession.builder \
-        .appName("TestesUnitarios-QualityLib") \
-        .master("local[1]") \
-        .config("spark.sql.shuffle.partitions", "1") \
+    spark = (
+        SparkSession.builder.appName("TestesUnitarios-QualityLib")
+        .master("local[1]")
+        .config("spark.sql.shuffle.partitions", "1")
         .getOrCreate()
+    )
     yield spark
     spark.stop()
 
@@ -64,7 +72,7 @@ def test_check_join_ratio_success():
         df_left=df_left,
         df_joined=df_joined,
         threshold_percent=95.0,
-        raise_on_failure=False
+        raise_on_failure=False,
     )
 
     assert ratio == 100.0
@@ -87,7 +95,7 @@ def test_check_join_ratio_failure_raises_exception():
             df_left=df_left,
             df_joined=df_joined,
             threshold_percent=95.0,
-            raise_on_failure=True
+            raise_on_failure=True,
         )
 
     assert "FALHA BLOQUEANTE DE QUALIDADE" in str(exc_info.value)
@@ -106,7 +114,7 @@ def test_check_join_ratio_zero_left():
         df_left=df_left,
         df_joined=df_joined,
         threshold_percent=95.0,
-        raise_on_failure=False
+        raise_on_failure=False,
     )
 
     assert ratio == 0.0
@@ -123,7 +131,9 @@ def test_check_null_threshold_success(spark_session):
     data = [("1302504", "AM"), ("1302603", "AM"), ("1300631", "AM")]
     df = spark_session.createDataFrame(data, ["id_municipio", "sigla_uf"])
 
-    metrics = check_null_threshold(df, columns=["id_municipio", "sigla_uf"], max_null_percent=5.0)
+    metrics = check_null_threshold(
+        df, columns=["id_municipio", "sigla_uf"], max_null_percent=5.0
+    )
 
     assert metrics["id_municipio"] == 0.0
     assert metrics["sigla_uf"] == 0.0
@@ -138,7 +148,9 @@ def test_check_null_threshold_exceeded_raises_exception(spark_session):
     df = spark_session.createDataFrame(data, ["id_municipio", "sigla_uf"])
 
     with pytest.raises(ValueError) as exc_info:
-        check_null_threshold(df, columns=["id_municipio"], max_null_percent=5.0, raise_on_failure=True)
+        check_null_threshold(
+            df, columns=["id_municipio"], max_null_percent=5.0, raise_on_failure=True
+        )
 
     assert "FALHA BLOQUEANTE" in str(exc_info.value)
     assert "50.00%" in str(exc_info.value)
@@ -154,7 +166,9 @@ def test_check_uniqueness_success(spark_session):
     data = [(2023, "1302504", "ALUNO_1"), (2023, "1302504", "ALUNO_2")]
     df = spark_session.createDataFrame(data, ["ano", "id_municipio", "id_aluno"])
 
-    dup_count, dup_pct = check_uniqueness(df, key_columns=["ano", "id_municipio", "id_aluno"])
+    dup_count, dup_pct = check_uniqueness(
+        df, key_columns=["ano", "id_municipio", "id_aluno"]
+    )
 
     assert dup_count == 0
     assert dup_pct == 0.0
@@ -168,12 +182,14 @@ def test_check_uniqueness_failure_raises_exception(spark_session):
     data = [
         (2023, "1302504", "ALUNO_1"),
         (2023, "1302504", "ALUNO_1"),  # DUPLICADO
-        (2023, "1302504", "ALUNO_2")
+        (2023, "1302504", "ALUNO_2"),
     ]
     df = spark_session.createDataFrame(data, ["ano", "id_municipio", "id_aluno"])
 
     with pytest.raises(ValueError) as exc_info:
-        check_uniqueness(df, key_columns=["ano", "id_municipio", "id_aluno"], raise_on_failure=True)
+        check_uniqueness(
+            df, key_columns=["ano", "id_municipio", "id_aluno"], raise_on_failure=True
+        )
 
     assert "Encontradas 1 linhas duplicadas" in str(exc_info.value)
 
@@ -196,10 +212,18 @@ def test_deduplicate_by_window_active_deduplication(spark_session):
         # Aluno 1 (Registro Recente com NOTA Preenchida - ESCOLHIDO)
         (2023, "1302504", "13015851", "3", "2", 750.5, "2026-10-28T12:00:00"),
         # Aluno 2 (Único)
-        (2023, "1302603", "13030738", "3", "2", 680.0, "2026-10-28T10:00:00")
+        (2023, "1302603", "13030738", "3", "2", 680.0, "2026-10-28T10:00:00"),
     ]
 
-    schema = ["ano", "id_municipio", "id_aluno", "rede", "serie", "proficiencia", "_ingested_at"]
+    schema = [
+        "ano",
+        "id_municipio",
+        "id_aluno",
+        "rede",
+        "serie",
+        "proficiencia",
+        "_ingested_at",
+    ]
     df_mock = spark_session.createDataFrame(data, schema)
 
     # Act
@@ -207,7 +231,7 @@ def test_deduplicate_by_window_active_deduplication(spark_session):
         df=df_mock,
         key_columns=["id_aluno", "id_municipio", "ano", "rede", "serie"],
         order_by_cols=["_ingested_at", "proficiencia"],
-        ascending=False
+        ascending=False,
     )
 
     # Assert

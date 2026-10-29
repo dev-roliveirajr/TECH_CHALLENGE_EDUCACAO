@@ -24,15 +24,18 @@ EXPECTED_S3_FILES = [
     "scripts/ingestion_bronze_layer.py",
     "scripts/quality_silver_layer.py",
     "scripts/aggregate_gold_layer.py",
-    "scripts/common/quality_lib.py"
+    "scripts/common/quality_lib.py",
 ]
+
 
 def check_s3_artifacts():
     print(f"📦 1. Verificando artefatos no S3 (s3://{S3_BUCKET}/)...")
     try:
         response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix="scripts/")
-        existing_keys = {item["Key"]: item["Size"] for item in response.get("Contents", [])}
-        
+        existing_keys = {
+            item["Key"]: item["Size"] for item in response.get("Contents", [])
+        }
+
         for key in EXPECTED_S3_FILES:
             if key in existing_keys:
                 size_bytes = existing_keys[key]
@@ -42,13 +45,14 @@ def check_s3_artifacts():
     except Exception as e:
         print(f"   ❌ Erro ao listar bucket S3: {str(e)}")
 
+
 def check_glue_jobs():
     print("\n⚙️ 2. Verificando configurações dos Glue Jobs no AWS Catalog...")
     for job_name in EXPECTED_JOBS:
         try:
             response = glue.get_job(JobName=job_name)
             job = response["Job"]
-            
+
             role = job.get("Role", "N/A")
             glue_ver = job.get("GlueVersion", "N/A")
             worker_type = job.get("WorkerType", "N/A")
@@ -56,7 +60,7 @@ def check_glue_jobs():
             max_retries = job.get("MaxRetries", "N/A")
             script_loc = job.get("Command", {}).get("ScriptLocation", "N/A")
             extra_py = job.get("DefaultArguments", {}).get("--extra-py-files", "N/A")
-            
+
             print(f"\n   🔹 Glue Job: {job_name}")
             print(f"      ├─ Script S3: {script_loc}")
             print(f"      ├─ Glue Version: {glue_ver}")
@@ -69,6 +73,7 @@ def check_glue_jobs():
         except Exception as e:
             print(f"   ❌ Erro ao consultar Job {job_name}: {str(e)}")
 
+
 def main():
     print("=" * 65)
     print("AUDITORIA E VALIDAÇÃO DA INFRAESTRUTURA NA AWS")
@@ -76,6 +81,7 @@ def main():
     check_s3_artifacts()
     check_glue_jobs()
     print("\n" + "=" * 65)
+
 
 if __name__ == "__main__":
     main()

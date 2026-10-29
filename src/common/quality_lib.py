@@ -2,7 +2,7 @@
 ===============================================================================
 BIBLIOTECA DE REGRAS DE QUALIDADE, CURADORIA E GOVERNANÇA (src/common/quality_lib.py)
 ===============================================================================
-Descrição: Módulo reutilizável para PySpark contendo travas bloqueantes de 
+Descrição: Módulo reutilizável para PySpark contendo travas bloqueantes de
 qualidade de dados (Taxa de Join, verificação de nulos, unicidade de chaves,
 deduplicação determinística por janela e validação cruzada para Gold).
 ===============================================================================
@@ -13,12 +13,13 @@ from pyspark.sql import DataFrame
 from pyspark.sql import Window
 import pyspark.sql.functions as F
 
+
 def check_join_ratio(
-    df_left: DataFrame, 
-    df_joined: DataFrame, 
+    df_left: DataFrame,
+    df_joined: DataFrame,
     match_key_col: Optional[str] = None,
     threshold_percent: float = 95.0,
-    raise_on_failure: bool = True
+    raise_on_failure: bool = True,
 ) -> Tuple[float, Dict[str, float]]:
     """Calcula e valida a Taxa de Correspondência (Match Ratio) de JOIN."""
     total_left = df_left.count()
@@ -45,7 +46,7 @@ def check_join_ratio(
         "total_left": total_left,
         "total_matched": total_matched,
         "match_ratio": round(match_ratio, 2),
-        "threshold_percent": threshold_percent
+        "threshold_percent": threshold_percent,
     }
 
     if match_ratio < threshold_percent:
@@ -57,16 +58,18 @@ def check_join_ratio(
         if raise_on_failure:
             raise ValueError(msg)
     else:
-        print(f"✅ [GATE APROVADO] Taxa de JOIN dentro do padrão estipulado ({match_ratio:.2f}% >= {threshold_percent:.2f}%).")
+        print(
+            f"✅ [GATE APROVADO] Taxa de JOIN dentro do padrão estipulado ({match_ratio:.2f}% >= {threshold_percent:.2f}%)."
+        )
 
     return match_ratio, metrics
 
 
 def check_null_threshold(
-    df: DataFrame, 
-    columns: List[str], 
+    df: DataFrame,
+    columns: List[str],
     max_null_percent: float = 5.0,
-    raise_on_failure: bool = True
+    raise_on_failure: bool = True,
 ) -> Dict[str, float]:
     """Valida se o percentual de NULOs está dentro do limite tolerado."""
     total_rows = df.count()
@@ -83,9 +86,11 @@ def check_null_threshold(
         null_count = df.filter(F.col(col).isNull()).count()
         null_percent = (null_count / float(total_rows)) * 100.0
         null_metrics[col] = round(null_percent, 2)
-        
+
         status = "✅ OK" if null_percent <= max_null_percent else "❌ EXCEDIDO"
-        print(f"   ├─ Coluna '{col}': {null_percent:.2f}% nulos ({null_count:,} linhas) -> {status}")
+        print(
+            f"   ├─ Coluna '{col}': {null_percent:.2f}% nulos ({null_count:,} linhas) -> {status}"
+        )
 
         if null_percent > max_null_percent:
             failed_cols.append((col, null_percent))
@@ -98,9 +103,7 @@ def check_null_threshold(
 
 
 def check_uniqueness(
-    df: DataFrame, 
-    key_columns: List[str],
-    raise_on_failure: bool = True
+    df: DataFrame, key_columns: List[str], raise_on_failure: bool = True
 ) -> Tuple[int, float]:
     """Verifica a unicidade das chaves do dataset."""
     total_rows = df.count()
@@ -126,27 +129,33 @@ def deduplicate_by_window(
     df: DataFrame,
     key_columns: List[str],
     order_by_cols: Optional[List[str]] = None,
-    ascending: bool = False
+    ascending: bool = False,
 ) -> DataFrame:
     """
     Deduplica um DataFrame com base em chave primária composta utilizando Window Function (row_number).
     Garante escolha determinística por prioridade (ex: recência de ingestão, notas não-nulas).
     """
     window_spec = Window.partitionBy(key_columns)
-    
+
     if order_by_cols:
         order_exprs = []
         for c in order_by_cols:
             if c in df.columns:
-                col_expr = F.col(c).asc_nulls_last() if ascending else F.col(c).desc_nulls_last()
+                col_expr = (
+                    F.col(c).asc_nulls_last()
+                    if ascending
+                    else F.col(c).desc_nulls_last()
+                )
                 order_exprs.append(col_expr)
         if order_exprs:
             window_spec = window_spec.orderBy(*order_exprs)
-            
-    df_dedup = df.withColumn("_row_num", F.row_number().over(window_spec)) \
-                 .filter(F.col("_row_num") == 1) \
-                 .drop("_row_num")
-                 
+
+    df_dedup = (
+        df.withColumn("_row_num", F.row_number().over(window_spec))
+        .filter(F.col("_row_num") == 1)
+        .drop("_row_num")
+    )
+
     return df_dedup
 
 
@@ -155,21 +164,25 @@ def check_cross_validation(
     calculated_col: str,
     published_col: str,
     max_divergence_percent: float = 2.0,
-    raise_on_failure: bool = False
+    raise_on_failure: bool = False,
 ) -> Tuple[float, Dict[str, float]]:
     """
     Validação Cruzada: Compara a taxa agregada recalculada via microdados de alunos com peso amostral
     contra a taxa oficial publicada pela dimensão territorial (Inep/Base dos Dados).
     """
-    df_valid = df_calculated.filter(F.col(calculated_col).isNotNull() & F.col(published_col).isNotNull())
+    df_valid = df_calculated.filter(
+        F.col(calculated_col).isNotNull() & F.col(published_col).isNotNull()
+    )
     total_records = df_valid.count()
-    
+
     if total_records == 0:
         print("⚠️ [VALIDAÇÃO CRUZADA] Sem registros pareados para comparação.")
         return 0.0, {"total_records": 0, "avg_divergence": 0.0}
 
     # Diferença absoluta entre taxa calculada pelo aluno e taxa publicada pelo município
-    df_diff = df_valid.withColumn("_diff_abs", F.abs(F.col(calculated_col) - F.col(published_col)))
+    df_diff = df_valid.withColumn(
+        "_diff_abs", F.abs(F.col(calculated_col) - F.col(published_col))
+    )
     avg_divergence = df_diff.select(F.avg("_diff_abs")).collect()[0][0] or 0.0
 
     print("=" * 70)
@@ -182,7 +195,7 @@ def check_cross_validation(
     metrics = {
         "total_records": total_records,
         "avg_divergence": round(avg_divergence, 3),
-        "tolerance": max_divergence_percent
+        "tolerance": max_divergence_percent,
     }
 
     if avg_divergence > max_divergence_percent:
@@ -191,6 +204,8 @@ def check_cross_validation(
         if raise_on_failure:
             raise ValueError(msg)
     else:
-        print(f"✅ [VALIDAÇÃO CRUZADA APROVADA] Alinhamento dentro da margem de tolerância ({avg_divergence:.3f}% <= {max_divergence_percent}%).")
+        print(
+            f"✅ [VALIDAÇÃO CRUZADA APROVADA] Alinhamento dentro da margem de tolerância ({avg_divergence:.3f}% <= {max_divergence_percent}%)."
+        )
 
     return avg_divergence, metrics

@@ -113,7 +113,7 @@ def deduplicate_by_window(
     Garante a escolha determinística do melhor registro conforme os critérios de prioridade.
     """
     window_spec = Window.partitionBy(key_columns)
-    
+
     if order_by_cols:
         order_exprs = [
             F.col(c).asc_nulls_last() if ascending else F.col(c).desc_nulls_last()
@@ -121,7 +121,7 @@ def deduplicate_by_window(
         ]
         if order_exprs:
             window_spec = window_spec.orderBy(*order_exprs)
-            
+
     return df.withColumn("_row_num", F.row_number().over(window_spec)) \
              .filter(F.col("_row_num") == 1) \
              .drop("_row_num")
@@ -137,7 +137,7 @@ Utilizando os metadados da tabela `dicionario`, os códigos numéricos são conv
 * **`preenchimento_caderno`**: Códigos numéricos são traduzidos para descrições como `'Prova não preenchida'` ou `'Prova preenchida'`.
 
 ### 4. Política Estrita de Tratamento de NULOs (Regra do Saeb)
-Conforme exigência do edital do Tech Challenge, **valores NULOS nas colunas `proficiencia` e `peso_aluno` NÃO são preenchidos com zero**. 
+Conforme exigência do edital do Tech Challenge, **valores NULOS nas colunas `proficiencia` e `peso_aluno` NÃO são preenchidos com zero**.
 * **Justificativa de Estatística Educacional**: A atribuição de zero para um estudante ausente ou que não realizou o exame reduz artificialmente a média de proficiência da escola e do município, gerando uma distorção grave nas análises de desempenho do Saeb.
 * Os 513.338 registros NULOs (13,27%) correspondem a estudantes ausentes e são estritamente preservados como `NULL`.
 
