@@ -46,7 +46,10 @@ GOLD_PATH = f"s3://{S3_BUCKET}/gold/"
 AUDIT_PATH = f"s3://{S3_BUCKET}/auditoria/gold/"
 
 run_id = os.getenv(
-    "GLUE_RUN_ID", f"gld_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+    "GLUE_RUN_ID",
+    os.getenv(
+        "JOB_RUN_ID", f"gld_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+    ),
 )
 ingestion_date = datetime.datetime.utcnow().strftime("%Y-%m-%d")
 
@@ -82,7 +85,9 @@ df_indicadores_mun = (
         F.count("*").alias("total_alunos_avaliados"),
         F.sum("peso_aluno").alias("soma_peso_amostral"),
         F.sum(
-            F.when(F.col("alfabetizado") == "Sim", F.col("peso_aluno")).otherwise(0)
+            F.when(
+                F.col("alfabetizado").isin("Sim", "1", 1), F.col("peso_aluno")
+            ).otherwise(0)
         ).alias("soma_peso_alfabetizados"),
         F.avg("proficiencia").alias("media_proficiencia_simples"),
         F.first("taxa_alfabetizacao_municipio").alias(
@@ -111,12 +116,14 @@ cv_diff = 0.0
 
 if check_cross_validation:
     try:
-        cv_passed, cv_diff = check_cross_validation(
+        avg_divergence, cv_metrics = check_cross_validation(
             df_recalculated=df_indicadores_mun,
-            calc_col="taxa_alfabetizacao_recalculada",
-            official_col="taxa_alfabetizacao_oficial_inep",
-            max_tolerance_percent=2.0,
+            calculated_col="taxa_alfabetizacao_recalculada",
+            published_col="taxa_alfabetizacao_oficial_inep",
+            max_divergence_percent=2.0,
         )
+        cv_diff = float(avg_divergence)
+        cv_passed = cv_diff <= 2.0
     except Exception as cv_err:
         print(f"  └─ ⚠️ Alerta na Validação Cruzada: {str(cv_err)}")
 

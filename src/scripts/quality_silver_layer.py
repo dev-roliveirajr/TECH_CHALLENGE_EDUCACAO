@@ -16,6 +16,7 @@ from awsglue.context import GlueContext
 from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
 import pyspark.sql.functions as F
+from delta.tables import DeltaTable
 
 # Importando a biblioteca de qualidade enviada via --extra-py-files
 from quality_lib import (
@@ -30,6 +31,16 @@ spark = glueContext.spark_session
 # Parâmetros passados pelo Glue Job
 args = getResolvedOptions(sys.argv, ["JOB_NAME"])
 job_name = args["JOB_NAME"]
+
+# Obtém o JOB_RUN_ID de forma resiliente
+run_id = os.getenv("GLUE_RUN_ID", os.getenv("JOB_RUN_ID", None))
+if not run_id:
+    for i, arg in enumerate(sys.argv):
+        if arg in ["--JOB_RUN_ID", "--job-run-id"] and i + 1 < len(sys.argv):
+            run_id = sys.argv[i + 1]
+            break
+if not run_id:
+    run_id = "local_run"
 
 S3_BUCKET = os.getenv("S3_BUCKET_NAME")
 if not S3_BUCKET:
@@ -54,6 +65,35 @@ print(f"   Bucket: {S3_BUCKET}")
 print(f"   Limiar de Join: {JOIN_THRESHOLD}% | Trava Bloqueante: {BLOCK_ON_FAILURE}")
 print("=" * 75)
 
+
+def get_latest_bronze_manifest(bucket_name):
+    """Localiza e lê o último manifesto de auditoria gerado pela Camada Bronze."""
+    try:
+        s3_client = boto3.client("s3")
+        prefix = "auditoria/bronze/"
+        response = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
+        if "Contents" not in response:
+            return None
+
+        manifest_files = [
+            obj for obj in response["Contents"] if obj["Key"].endswith("manifest.json")
+        ]
+        if not manifest_files:
+            return None
+
+        sorted_files = sorted(
+            manifest_files, key=lambda x: x["LastModified"], reverse=True
+        )
+        latest_key = sorted_files[0]["Key"]
+        obj_resp = s3_client.get_object(Bucket=bucket_name, Key=latest_key)
+        return json.loads(obj_resp["Body"].read().decode("utf-8"))
+    except Exception as e:
+        print(f"⚠️ Alerta ao buscar manifesto Bronze: {str(e)}")
+        return None
+
+
+# 1. Leitura Cirúrgica das entidades da Bronze via Manifesto
+print("📥 1. Carregando tabelas da Camada Bronze via Manifesto JSON...")
 # 1. Leitura das entidades da Bronze
 print("📥 1. Carregando tabelas da Camada Bronze...")
 
@@ -68,10 +108,37 @@ table_names = [
     "dicionario",
 ]
 
+bronze_manifest = get_latest_bronze_manifest(S3_BUCKET)
+manifest_prefixes = {}
+
+if bronze_manifest and "tables_metrics" in bronze_manifest:
+    manifest_uri = bronze_manifest.get("manifest_s3_uri", "N/A")
+    print(f"📜 [Governança] Manifesto Bronze localizado e ativado: {manifest_uri}")
+    for item in bronze_manifest["tables_metrics"]:
+        ent = item.get("entity")
+        prefix = item.get("s3_prefix")
+        if (
+            ent
+            and prefix
+            and item.get("status") in ["SUCCEEDED", "SKIPPED (Already Up-to-Date)"]
+        ):
+            manifest_prefixes[ent] = prefix
+
 for name in table_names:
     try:
-        tables[name] = spark.read.parquet(f"{BRONZE_PATH}{name}/")
-        print(f" ├─ [{name}] Carregado com sucesso de: {BRONZE_PATH}{name}/")
+        base_path = f"{BRONZE_PATH}{name}/"
+        if name in manifest_prefixes:
+            target_path = manifest_prefixes[name]
+            print(
+                f" ├─ [{name}] Leitura restrita via Manifesto (Lote com basePath): {target_path}"
+            )
+            tables[name] = spark.read.option("basePath", base_path).parquet(target_path)
+        else:
+            fallback_path = base_path
+            print(
+                f" ├─ [{name}] Leitura genérica da raiz Bronze (Fallback): {fallback_path}"
+            )
+            tables[name] = spark.read.parquet(fallback_path)
     except Exception as e:
         print(f" ⚠️ Erro ao carregar [{name}]: {str(e)}")
 
@@ -107,10 +174,10 @@ for name, df in tables.items():
         print(f"   ├─ {field.name:<40} : {field.dataType.simpleString()}")
 
     # 2.2 Preview das 3 primeiras linhas (Tabela Markdown)
-    print("\n👀 Preview das 3 primeiras linhas (Tabela Markdown):")
+    print("\n👀 Preview das primeiras linhas (Tabela Markdown):")
     cols = df.columns
     try:
-        sample_rows = df.limit(10).collect()
+        sample_rows = df.limit(5).collect()
         header_line = "| " + " | ".join(cols) + " |"
         sep_line = "| " + " | ".join(["---"] * len(cols)) + " |"
         print(header_line)
@@ -269,6 +336,10 @@ meta_cols_to_drop = ["_ingested_at", "_source", "ref_ano", "ref_mes", "ref_dia"]
 for m_col in meta_cols_to_drop:
     if m_col in df_municipio.columns:
         df_municipio = df_municipio.drop(m_col)
+    if m_col in df_uf.columns:
+        df_uf = df_uf.drop(m_col)
+    if m_col in df_meta_mun.columns:
+        df_meta_mun = df_meta_mun.drop(m_col)
 
 mun_cols_rename = {
     "taxa_alfabetizacao": "taxa_alfabetizacao_municipio",
@@ -283,11 +354,6 @@ for old_c, new_c in mun_cols_rename.items():
     if old_c in df_municipio.columns:
         df_municipio = df_municipio.withColumnRenamed(old_c, new_c)
 
-# Preparar Dimensão UF
-for m_col in meta_cols_to_drop:
-    if m_col in df_uf.columns:
-        df_uf = df_uf.drop(m_col)
-
 uf_cols_rename = {
     "taxa_alfabetizacao": "taxa_alfabetizacao_uf",
     "media_portugues": "media_portugues_uf",
@@ -298,11 +364,6 @@ for i in range(9):
 for old_c, new_c in uf_cols_rename.items():
     if old_c in df_uf.columns:
         df_uf = df_uf.withColumnRenamed(old_c, new_c)
-
-# Preparar Dimensão Metas Município
-for m_col in meta_cols_to_drop:
-    if m_col in df_meta_mun.columns:
-        df_meta_mun = df_meta_mun.drop(m_col)
 
 meta_cols_rename = {
     "taxa_alfabetizacao": "taxa_alfabetizacao_meta_mun",
@@ -319,15 +380,13 @@ print("🔗 5. Executando O GRANDE JOIN Relacional (Sem Explosão nem Ambiguidad
 print("#" * 75 + "\n")
 
 # JOIN 1: Alunos + Municipio
-df_joined = df_alunos.join(
-    df_municipio, on=["id_municipio", "ano", "rede", "serie"], how="left"
+df_joined = (
+    df_alunos.join(
+        df_municipio, on=["id_municipio", "ano", "rede", "serie"], how="left"
+    )
+    .join(df_uf, on=["sigla_uf", "ano", "rede", "serie"], how="left")
+    .join(df_meta_mun, on=["id_municipio", "ano", "rede"], how="left")
 )
-
-# JOIN 2: + UF
-df_joined = df_joined.join(df_uf, on=["sigla_uf", "ano", "rede", "serie"], how="left")
-
-# JOIN 3: + Meta Municipio
-df_joined = df_joined.join(df_meta_mun, on=["id_municipio", "ano", "rede"], how="left")
 
 # 6. Validando Gate de Qualidade
 print("\n" + "#" * 75)
@@ -360,23 +419,42 @@ if (
 # Timestamp de enriquecimento da camada Silver
 df_joined = df_joined.withColumn("_processed_silver_at", F.current_timestamp())
 
-# 7. Gravação no S3
+# 7. Gravação em Tabela Delta Lake com MERGE INTO (Upsert)
 print("\n" + "#" * 75)
-print("💾 7. Gravando no S3")
+print("💾 7. Persistindo na Camada Silver em Formato Delta Lake (ACID)")
 print("#" * 75 + "\n")
 
 output_path = f"{SILVER_PATH}alunos_curado/"
-print(f"\n💾 7. Gravando dataset curado em: {output_path}")
+print(f"💾 Alvo do Dataset Delta Lake: {output_path}")
 
-df_joined.write.mode("overwrite").parquet(output_path)
+try:
+    is_delta = DeltaTable.isDeltaTable(spark, output_path)
+except Exception:
+    is_delta = False
 
-print("  └─ ✅ Dataset curado gravado na Camada Silver com sucesso!")
+if is_delta:
+    print(
+        "🔄 Tabela Delta existente detectada. Executando MERGE INTO (Upsert por id_aluno + ano)..."
+    )
+    delta_target = DeltaTable.forPath(spark, output_path)
+    delta_target.alias("target").merge(
+        source=df_joined.alias("source"),
+        condition="target.id_aluno = source.id_aluno AND target.ano = source.ano",
+    ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+    print(
+        "  └─ ✅ Operação MERGE INTO (Upsert) executada com sucesso na Tabela Delta Silver!"
+    )
+else:
+    print("🆕 Criando nova Tabela Delta Silver inicial...")
+    df_joined.write.format("delta").mode("overwrite").save(output_path)
+    print("  └─ ✅ Tabela Delta Silver inicial gravada com sucesso!")
 
 # 8. Salvando Manifesto da Camada Silver
 try:
     s3_client = boto3.client("s3")
     manifest_data = {
-        "job_name": args["JOB_NAME"],
+        "job_name": job_name,
+        "run_id": run_id,
         "status": "SUCCEEDED",
         "input_rows": int(metrics.get("total_left", 0)),
         "output_rows": int(metrics.get("total_matched", 0)),
@@ -385,7 +463,6 @@ try:
         "s3_path": output_path,
     }
 
-    run_id = os.getenv("GLUE_RUN_ID", "local_run")
     manifest_key = (
         f"auditoria/silver/ingestion_date=2026-10-29/run_id={run_id}/manifest.json"
     )

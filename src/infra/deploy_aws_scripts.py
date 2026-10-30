@@ -267,10 +267,12 @@ def _register_glue_job(item, extra_py_files, extra_jars, additional_modules):
             "--extra-py-files": extra_py_files,
             "--extra-jars": extra_jars,
             "--additional-python-modules": additional_modules,
+            "--datalake-formats": "delta",
             "--S3_BUCKET_NAME": S3_BUCKET,
             "--TempDir": f"s3://{S3_BUCKET}/temp/",
             "--enable-metrics": "true",
             "--enable-continuous-cloudwatch-log": "true",
+            "--conf": "spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog",
         },
         "GlueVersion": "4.0",
         "NumberOfWorkers": 2,
@@ -341,6 +343,7 @@ def main():
     print(
         "   📦 Módulos Python e JARs configurados via --additional-python-modules e /libs/"
     )
+    print("   🔺 Suporte ao Delta Lake habilitado via --datalake-formats delta")
     print("   🧹 Repositório local 100% limpo (Zero arquivos temporários mantidos)")
     print("=" * 75)
 

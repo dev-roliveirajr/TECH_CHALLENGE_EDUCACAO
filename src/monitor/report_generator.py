@@ -326,7 +326,7 @@ def generate_job_report(
 """
 
         os.makedirs(output_dir, exist_ok=True)
-        filename = f"report_{job_name}_{today_date}.md"
+        filename = f"report_{today_date}_{job_name}.md"
         file_path = os.path.join(output_dir, filename)
 
         with open(file_path, "w", encoding="utf-8") as f:

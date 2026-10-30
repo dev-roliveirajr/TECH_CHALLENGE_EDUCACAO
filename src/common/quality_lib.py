@@ -9,8 +9,7 @@ deduplicação determinística por janela e validação cruzada para Gold).
 """
 
 from typing import List, Dict, Optional, Tuple
-from pyspark.sql import DataFrame
-from pyspark.sql import Window
+from pyspark.sql import DataFrame, Window
 import pyspark.sql.functions as F
 
 
@@ -160,7 +159,7 @@ def deduplicate_by_window(
 
 
 def check_cross_validation(
-    df_calculated: DataFrame,
+    df_recalculated: DataFrame,
     calculated_col: str,
     published_col: str,
     max_divergence_percent: float = 2.0,
@@ -170,7 +169,7 @@ def check_cross_validation(
     Validação Cruzada: Compara a taxa agregada recalculada via microdados de alunos com peso amostral
     contra a taxa oficial publicada pela dimensão territorial (Inep/Base dos Dados).
     """
-    df_valid = df_calculated.filter(
+    df_valid = df_recalculated.filter(
         F.col(calculated_col).isNotNull() & F.col(published_col).isNotNull()
     )
     total_records = df_valid.count()
@@ -183,7 +182,9 @@ def check_cross_validation(
     df_diff = df_valid.withColumn(
         "_diff_abs", F.abs(F.col(calculated_col) - F.col(published_col))
     )
-    avg_divergence = df_diff.select(F.avg("_diff_abs")).collect()[0][0] or 0.0
+
+    rows = df_diff.select(F.avg("_diff_abs")).collect()
+    avg_divergence = float(rows[0][0]) if rows and rows[0][0] is not None else 0.0
 
     print("=" * 70)
     print("🔬 [VALIDAÇÃO CRUZADA - MICRODADOS vs. TAXA PUBLICADA]")
