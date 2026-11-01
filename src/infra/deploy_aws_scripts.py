@@ -78,6 +78,11 @@ SCRIPTS_TO_DEPLOY = [
         "job_name": "03_gold_aggregation",
     },
     {
+        "local": "src/scripts/events_processor.py",
+        "s3_key": "scripts/events_processor.py",
+        "job_name": "04_events_processor",
+    },
+    {
         "local": "src/common/quality_lib.py",
         "s3_key": "scripts/common/quality_lib.py",
         "job_name": None,
@@ -248,7 +253,7 @@ def _upload_connector_jar(s3_jar_key):
         )
         urllib.request.urlretrieve(BIGQUERY_JAR_URL, temp_jar_path)
         s3_client.upload_file(temp_jar_path, S3_BUCKET, s3_jar_key)
-        s3_client.upload_file(temp_jar_path, S3_BUCKET, f"jars/libs/{LOCAL_JAR_NAME}")
+        s3_client.upload_file(temp_jar_path, S3_BUCKET, f"libs/{LOCAL_JAR_NAME}")
         print(f"  └─ 📦 Upload BigQuery JAR -> s3://{S3_BUCKET}/{s3_jar_key}")
 
 

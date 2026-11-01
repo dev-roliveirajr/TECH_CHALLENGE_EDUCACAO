@@ -12,6 +12,7 @@ help:
 	@echo "  make lint      - Valida conformidade PEP 8 com flake8"
 	@echo "  make test      - Executa suite de testes com pytest"
 	@echo "  make aws      	- Executa o setup e deploy dos scripts e jobs na AWS"
+	@echo "  make events	- Gera eventos de novos alunos e atualiza as metas por municipios"
 	@echo "  make clean     - Remove caches e arquivos temporários"
 
 install:
@@ -31,6 +32,10 @@ test:
 
 aws:
 	python src/infra/deploy_aws_scripts.py
+
+events:
+	python src/generators/generate_alunos_events.py -n 100 
+	python src/generators/generate_metas_events.py -d municipio -n 20
 
 clean:
 	find . -type f -name "*.pyc" -delete
