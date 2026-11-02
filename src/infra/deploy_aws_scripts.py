@@ -159,6 +159,7 @@ def _bucket_is_available():
 
 
 def _configure_bucket_security():
+    setup_s3_lifecycle_rules()
     try:
         s3_client.put_bucket_ownership_controls(
             Bucket=S3_BUCKET,
@@ -202,6 +203,35 @@ def _configure_bucket_security():
     except Exception as error:
         print(f"     └─ ⚠️ Aviso em Criptografia: {str(error)}")
 
+def setup_s3_lifecycle_rules():
+    """
+    Configura a Regra de Ciclo de Vida do S3 (Lifecycle Rule) para expirar/deletar
+    automaticamente os arquivos da Landing Zone (bronze/events_raw_landing/) após 7 dias.
+    Isso garante limpeza automatizada sem depender de intervenção manual ou scripts.
+    """
+    print(f"\n♻️ Configurando S3 Lifecycle Rule para Landing Zone em 's3://{S3_BUCKET}'...")
+    lifecycle_config = {
+        "Rules": [
+            {
+                "ID": "ExpireRawLandingZoneEventsAfter7Days",
+                "Status": "Enabled",
+                "Filter": {
+                    "Prefix": "bronze/events_raw_landing/"
+                },
+                "Expiration": {
+                    "Days": 7
+                }
+            }
+        ]
+    }
+    try:
+        s3_client.put_bucket_lifecycle_configuration(
+            Bucket=S3_BUCKET,
+            LifecycleConfiguration=lifecycle_config
+        )
+        print("  └─ ✅ Regra de Expiração S3 criada/atualizada: 'bronze/events_raw_landing/' (Expiração: 7 Dias).")
+    except Exception as err:
+        print(f"  └─ ⚠️ Aviso ao configurar S3 Lifecycle Rule: {err}")
 
 def prepare_and_create_s3_bucket():
     """
@@ -217,6 +247,7 @@ def prepare_and_create_s3_bucket():
     print(f"\n🪣 2. Verificando/Criando Bucket S3 ('s3://{S3_BUCKET}')...")
 
     if _bucket_is_available():
+        setup_s3_lifecycle_rules()
         return
 
     try:
@@ -234,6 +265,7 @@ def prepare_and_create_s3_bucket():
         )
 
     _configure_bucket_security()
+    setup_s3_lifecycle_rules()
 
 
 def _upload_connector_jar(s3_jar_key):

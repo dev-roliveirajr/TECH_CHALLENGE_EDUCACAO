@@ -34,8 +34,8 @@ aws:
 	python src/infra/deploy_aws_scripts.py
 
 events:
-	python src/generators/generate_alunos_events.py -n 100 
-	python src/generators/generate_metas_events.py -d municipio -n 20
+	python src/generators/generate_alunos_events.py -n $$(python -c "import random; print(random.randint(1, 50))")
+#	python src/generators/generate_metas_events.py -d municipio -n $$(python -c "import random; print(random.randint(1, 20))")
 
 clean:
 	find . -type f -name "*.pyc" -delete

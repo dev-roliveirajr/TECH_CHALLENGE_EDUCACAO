@@ -55,7 +55,7 @@ def generate_single_aluno_event(custom_aluno_id=None, custom_municipio_id=None):
         "id_aluno": id_aluno,
         "id_municipio": id_municipio,
         "id_escola": str(random.randint(60000000, 69999999)),
-        "ano": 2024,
+        "ano": random.randint(2024, 2026),
         "serie": "2",
         "rede": random.choice(["2", "3"]),  # 2=Estadual, 3=Municipal
         "caderno": "1",
