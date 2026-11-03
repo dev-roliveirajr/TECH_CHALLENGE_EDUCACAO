@@ -110,9 +110,9 @@ gold_already_built = (
 
 if silver_status == "SKIPPED (Already Up-to-Date)" and gold_already_built:
     print("\n" + "=" * 75)
-    print("⚡ [SHORT-CIRCUIT FINOPS] Camada Silver permaneceu inalterada (Status SKIPPED).")
+    print("⚡ Camada Silver permaneceu inalterada (Status SKIPPED).")
     print("   Datasets Analíticos da Camada Gold já se encontram 100% atualizados no S3.")
-    print("   └─ ⏩ Processamento Gold SKIPPED com sucesso em segundos!")
+    print("   └─ ⏩ Processamento Gold SKIPPED com sucesso!")
     print("=" * 75)
 
     manifest_content = {

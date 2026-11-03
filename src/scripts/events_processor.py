@@ -25,8 +25,35 @@ except ImportError:
 try:
     from pyspark.sql import SparkSession
     import pyspark.sql.functions as F
-    from pyspark.sql.types import DoubleType, TimestampType
+    from pyspark.sql.types import (
+        DoubleType,
+        IntegerType,
+        StringType,
+        StructField,
+        StructType,
+    )
     HAS_PYSPARK = True
+
+    # Contrato explícito dos eventos de alunos (NDJSON).
+    # Campos obrigatórios são validados no foreachBatch.
+    EVENTOS_ALUNOS_SCHEMA = StructType([
+        StructField("event_id", StringType(), True),
+        StructField("event_time", StringType(), True),
+        StructField("id_aluno", StringType(), True),
+        StructField("id_municipio", StringType(), True),
+        StructField("id_escola", StringType(), True),
+        StructField("ano", IntegerType(), True),
+        StructField("serie", StringType(), True),
+        StructField("rede", StringType(), True),
+        StructField("caderno", StringType(), True),
+        StructField("presenca", StringType(), True),
+        StructField("preenchimento_caderno", StringType(), True),
+        StructField("alfabetizado", StringType(), True),
+        StructField("proficiencia", DoubleType(), True),
+        StructField("peso_aluno", DoubleType(), True),
+        StructField("_source", StringType(), True),
+        StructField("_ingested_at", StringType(), True),
+    ])
 except ImportError:
     SparkSession = None
     HAS_PYSPARK = False
@@ -139,6 +166,15 @@ def check_local_events_exist(base_dir):
     return False
 
 
+def check_events_path_exists(path):
+    """Verifica se um caminho contém arquivos JSON antes de iniciar o streaming."""
+    if LOCAL_MODE:
+        return check_local_events_exist(path)
+
+    prefix = path.replace(f"s3://{S3_BUCKET}/", "", 1)
+    return check_s3_events_exist(S3_BUCKET, prefix)
+
+
 # 3. Pré-checagem de Eventos (Short-Circuit FinOps)
 events_exist = False
 if LOCAL_MODE:
@@ -199,12 +235,58 @@ latency_stats = {"avg_sec": 0.0, "min_sec": 0.0, "max_sec": 0.0}
 def process_alunos_batch(df_batch, batch_id):
     """Callback para cada micro-lote de alunos consumido via Structured Streaming."""
     global processed_alunos_count, latency_stats
+
+    # -------------------------------------------------------------------------
+    # VALIDAÇÃO DE INTEGRIDADE DO CONTRATO
+    # -------------------------------------------------------------------------
+
+    print(f"\n  └─ ℹ️ Verificando a integridade do contrato json\n")
+
+    try:
+        invalid_condition = (
+            F.col("event_id").isNull()
+            | (F.trim(F.col("event_id")) == "")
+            | F.col("id_aluno").isNull()
+            | (F.trim(F.col("id_aluno")) == "")
+            | F.col("id_municipio").isNull()
+            | (F.trim(F.col("id_municipio")) == "")
+            | F.col("id_escola").isNull()
+            | (F.trim(F.col("id_escola")) == "")
+            | F.col("ano").isNull()
+        )
+
+        invalid_records = (
+            df_batch
+            .filter(invalid_condition)
+            .limit(1)
+            .count()
+        )
+
+        if invalid_records > 0:
+            raise ValueError(
+                "Registro inválido: existem campos obrigatórios "
+                "ausentes ou vazios no evento."
+            )
+
+        print("  └─ ✅ Estrutura contém os campos obrigatórios.\n")
+
+    except Exception as e:
+        raise ValueError(
+            f"❌ Falha na validação do contrato JSON: {e}"
+        ) from e
+
+    # -------------------------------------------------------------------------
+
     batch_count = df_batch.count()
     if batch_count == 0:
+        print(f"  └─ ℹ️ Micro-lote {batch_id} vazio; nenhum registro para processar.")
         return
 
-    print(f"\n  └─ 📡 Micro-lote {batch_id} (Alunos): {batch_count:,} registros inéditos encontrados.")
-
+    print(
+        f"\n  └─ 📡 Micro-lote {batch_id} (Alunos): "
+        f"{batch_count:,} registros inéditos encontrados."
+    )
+    
     # Garantir Timestamp UTC no Ingestion
     df_batch = df_batch.withColumn(
         "_ingested_at_ts", F.current_timestamp()
@@ -255,8 +337,15 @@ def process_alunos_batch(df_batch, batch_id):
         )
 
     # Adicionar Colunas de Partição e Controle do Ingestion
+    if "_ingested_at" not in df_batch.columns:
+        if "event_time" in df_batch.columns:
+            df_batch = df_batch.withColumn("_ingested_at", F.col("event_time"))
+        else:
+            df_batch = df_batch.withColumn("_ingested_at", F.date_format(F.current_timestamp(), "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"))
+    else:
+        df_batch = df_batch.withColumn("_ingested_at", F.coalesce(F.col("_ingested_at"), F.col("event_time")))
+
     df_batch = df_batch \
-        .withColumn("_ingested_at", F.current_timestamp()) \
         .withColumn("_processed_silver_at", F.current_timestamp()) \
         .withColumn("ref_ano", F.col("ano").cast("int")) \
         .withColumn("ref_mes", F.month(F.col("_event_time_ts"))) \
@@ -268,10 +357,7 @@ def process_alunos_batch(df_batch, batch_id):
     print(f"🔄 Executando MERGE INTO no Delta Lake Silver: {silver_target_path}")
 
     if HAS_GLUE:
-        try:
-            is_delta = DeltaTable.isDeltaTable(spark, silver_target_path)
-        except Exception:
-            is_delta = False
+        is_delta = DeltaTable.isDeltaTable(spark, silver_target_path)
 
         if is_delta:
             delta_target = DeltaTable.forPath(spark, silver_target_path)
@@ -309,8 +395,37 @@ def process_metas_batch(df_batch, batch_id):
     batch_count = df_batch.count()
     if batch_count == 0:
         return
+
+    print(f"  └─ 🎯 Eventos de Metas (Micro-lote {batch_id}): {batch_count:,} registros encontrados.")
+
+    meta_target_path = f"{SILVER_PATH}meta_alfabetizacao_municipio/"
+    print(f"  └─ 🔄 Persistindo eventos de metas na Camada Silver: {meta_target_path}")
+
+    if HAS_GLUE:
+        try:
+            is_delta = DeltaTable.isDeltaTable(spark, meta_target_path)
+        except Exception:
+            is_delta = False
+
+        if is_delta:
+            delta_target = DeltaTable.forPath(spark, meta_target_path)
+            cond = "target.id_municipio = source.id_municipio AND target.ano = source.ano"
+            if "rede" in df_batch.columns:
+                cond += " AND target.rede = source.rede"
+
+            delta_target.alias("target").merge(
+                source=df_batch.alias("source"),
+                condition=cond
+            ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+            print("  └─ ✅ MERGE INTO de Metas executado com sucesso no Delta Lake Silver!")
+        else:
+            df_batch.write.format("delta").mode("append").save(meta_target_path)
+            print("  └─ ✅ Eventos de Metas salvos via Append na Silver!")
+    else:
+        df_batch.write.mode("append").parquet(meta_target_path)
+        print("  └─ ✅ Eventos de Metas gravados na Silver em modo Fallback!")
+
     processed_metas_count += batch_count
-    print(f"  └─ 🎯 Eventos de Metas (Micro-lote {batch_id}): {batch_count:,} registros processados.")
 
 
 if HAS_PYSPARK and spark:
@@ -318,8 +433,12 @@ if HAS_PYSPARK and spark:
     # 4.1 Processamento de Eventos de ALUNOS (Structured Streaming)
     # -----------------------------------------------------------------------------
     try:
-        print(f" ├─ [Domínio: Alunos] Streaming com checkpointLocation em: {checkpoint_alunos}")
-        read_stream_alunos = spark.readStream.option("spark.sql.streaming.schemaInference", "true")
+        print(f" ├─ [Domínio: Alunos] Streaming com schema explícito e checkpointLocation em: {checkpoint_alunos}")
+        read_stream_alunos = (
+            spark.readStream
+            .schema(EVENTOS_ALUNOS_SCHEMA)
+            .option("mode", "FAILFAST")
+        )
         if not LOCAL_MODE:
             read_stream_alunos = read_stream_alunos.option("recursiveFileLookup", "true")
 
@@ -334,7 +453,8 @@ if HAS_PYSPARK and spark:
 
         query_alunos.awaitTermination()
     except Exception as e_alunos:
-        print(f"  ℹ️ Informação sobre processamento streaming de alunos: {e_alunos}")
+        print(f"  ❌ Falha no processamento streaming de alunos: {e_alunos}")
+        raise
 
     # -----------------------------------------------------------------------------
     # 4.2 Processamento de Eventos de METAS (Structured Streaming)
@@ -347,8 +467,19 @@ if HAS_PYSPARK and spark:
     ] if not LOCAL_MODE else [os.path.join(EVENTS_LANDING_BASE, "metas")]
 
     for idx, m_path in enumerate(meta_paths_to_check):
+        if not check_events_path_exists(m_path):
+            print(
+                f"  └─ ℹ️ Caminho de metas sem arquivos JSON; ignorando: {m_path}"
+            )
+            continue
+
+        print(f"  └─ ℹ️ Processando eventos encontrados em: {m_path}")
         try:
-            read_metas = spark.readStream.option("spark.sql.streaming.schemaInference", "true")
+            read_metas = (
+                spark.readStream
+                .option("spark.sql.streaming.schemaInference", "true")
+                .option("mode", "FAILFAST")
+            )
             if not LOCAL_MODE:
                 read_metas = read_metas.option("recursiveFileLookup", "true")
 
@@ -362,14 +493,20 @@ if HAS_PYSPARK and spark:
                 .start()
 
             q_metas.awaitTermination()
-        except Exception:
-            pass
+        except Exception as e_metas:
+            print(
+                f"  ❌ Falha no processamento do caminho de metas "
+                f"'{m_path}': {e_metas}"
+            )
+            raise
 
 # -----------------------------------------------------------------------------
 # 5. Manifesto de Auditoria de Eventos
 # -----------------------------------------------------------------------------
 total_processed = processed_alunos_count + processed_metas_count
 print("\n" + "=" * 75)
+print(f"✅ PROCESSAMENTO DE EVENTOS DE ALUNOS: {processed_alunos_count:,} eventos inéditos.")
+print(f"✅ PROCESSAMENTO DE EVENTOS DE METAS: {processed_metas_count:,} eventos inéditos.")
 print(f"✅ PROCESSAMENTO DE EVENTOS CONCLUÍDO! Total: {total_processed:,} eventos inéditos.")
 print("=" * 75)
 
@@ -397,6 +534,26 @@ if not LOCAL_MODE and HAS_BOTO3:
             ContentType="application/json"
         )
         print(f"📜 [Auditoria Eventos] Manifesto salvo no S3: s3://{S3_BUCKET}/{manifest_key}")
+
+        # Se novos eventos foram integrados à Silver, atualiza o manifesto em auditoria/silver/ para desativar o short-circuit da Gold
+        if total_processed > 0:
+            silver_manifest_data = {
+                "job_name": job_name,
+                "run_id": run_id,
+                "ingestion_date": ingestion_date,
+                "status": "SUCCEEDED",
+                "total_events_processed": total_processed,
+                "message": "Atualização incremental via Streaming Events integrada com sucesso à Camada Silver."
+            }
+            silver_manifest_key = f"auditoria/silver/ingestion_date={ingestion_date}/run_id={run_id}/manifest.json"
+            s3_client.put_object(
+                Bucket=S3_BUCKET,
+                Key=silver_manifest_key,
+                Body=json.dumps(silver_manifest_data, indent=2),
+                ContentType="application/json"
+            )
+            print(f"📜 [Governança Silver] Manifesto de atualização ativado para a Camada Gold: s3://{S3_BUCKET}/{silver_manifest_key}")
+
     except Exception as m_err:
         print(f"⚠️ Alerta ao salvar manifesto no S3: {m_err}")
 else:
@@ -404,3 +561,20 @@ else:
     with open(os.path.join(AUDIT_PATH, f"manifest_{run_id}.json"), "w") as f:
         json.dump(manifest_data, f, indent=2)
     print(f"📜 [Auditoria Eventos] Manifesto salvo localmente em: {AUDIT_PATH}")
+
+    if total_processed > 0:
+        silver_audit_dir = "data/auditoria/silver/"
+        os.makedirs(silver_audit_dir, exist_ok=True)
+        silver_manifest_data = {
+            "job_name": job_name,
+            "run_id": run_id,
+            "ingestion_date": ingestion_date,
+            "status": "SUCCEEDED",
+            "total_events_processed": total_processed,
+            "message": "Atualização incremental via Streaming Events."
+        }
+        with open(os.path.join(silver_audit_dir, f"manifest_{run_id}.json"), "w") as f:
+            json.dump(silver_manifest_data, f, indent=2)
+        print(f"📜 [Governança Silver] Manifesto de atualização salvo localmente em: {silver_audit_dir}")
+
+
