@@ -28,8 +28,9 @@ glueContext = GlueContext(sc)
 spark = glueContext.spark_session
 
 # Obter parâmetros de execução passados pelo Glue Job
-args = getResolvedOptions(sys.argv, ["JOB_NAME"])
+args = getResolvedOptions(sys.argv, ["JOB_NAME", "GLUE_DATABASE_NAME"])
 job_name = args["JOB_NAME"]
+GLUE_DATABASE_NAME = args["GLUE_DATABASE_NAME"]
 
 S3_BUCKET = os.getenv("S3_BUCKET_NAME")
 if not S3_BUCKET:
@@ -102,8 +103,8 @@ def check_s3_path_has_objects(prefix):
         return False
 
 gold_already_built = (
-    check_s3_path_has_objects(path_indicadores) and 
-    check_s3_path_has_objects(path_metas) and 
+    check_s3_path_has_objects(path_indicadores) and
+    check_s3_path_has_objects(path_metas) and
     check_s3_path_has_objects(path_features)
 )
 
@@ -277,6 +278,26 @@ else:
 
     df_feature_store.write.mode("overwrite").parquet(path_features)
     print(f"  └─ 💾 Feature Store salva em: {path_features}")
+
+    # Registro / Atualização das 3 tabelas no AWS Glue Data Catalog / Athena
+    print("\n🗄️ Registrando tabelas da Camada Gold no Athena / Glue Data Catalog...")
+
+    gold_tables_catalog = [
+        ("gold_indicadores_municipais", path_indicadores),
+        ("gold_desempenho_vs_metas", path_metas),
+        ("gold_features_alfabetizacao", path_features),
+    ]
+
+    for table_name, table_path in gold_tables_catalog:
+        try:
+            spark.sql(
+                f"CREATE TABLE IF NOT EXISTS `{GLUE_DATABASE_NAME}`.`{table_name}` USING PARQUET LOCATION '{table_path}'"
+            )
+            print(
+                f"  └─ ✅ Tabela `{GLUE_DATABASE_NAME}`.`{table_name}` registrada no Catalog com sucesso!"
+            )
+        except Exception as cat_err:
+            print(f"⚠️ Aviso ao registrar tabela '{table_name}' no Catalog: {cat_err}")
 
     # 7. Geração do Manifesto de Auditoria da Camada Gold no S3
     manifest_content = {

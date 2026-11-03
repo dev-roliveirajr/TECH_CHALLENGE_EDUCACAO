@@ -30,8 +30,9 @@ glueContext = GlueContext(sc)
 spark = glueContext.spark_session
 
 # Parâmetros passados pelo Glue Job
-args = getResolvedOptions(sys.argv, ["JOB_NAME"])
+args = getResolvedOptions(sys.argv, ["JOB_NAME", "GLUE_DATABASE_NAME"])
 job_name = args["JOB_NAME"]
+GLUE_DATABASE_NAME = args["GLUE_DATABASE_NAME"]
 
 # Obtém o JOB_RUN_ID de forma resiliente
 run_id = os.getenv("GLUE_RUN_ID", os.getenv("JOB_RUN_ID", None))
@@ -492,6 +493,23 @@ else:
         print("🆕 Criando nova Tabela Delta Silver inicial...")
         df_joined.write.format("delta").mode("overwrite").save(output_path)
         print("  └─ ✅ Tabela Delta Silver inicial gravada com sucesso!")
+
+    # Registra / Atualiza o apontamento da tabela Delta Lake no Glue Data Catalog (Athena)
+
+    # debug:
+    print(f"DEBUG output_path: [{output_path}]")
+    print(f"DEBUG db_name: [{GLUE_DATABASE_NAME}]")
+    print(f"DEBUG Spark warehouse: {spark.conf.get('spark.sql.warehouse.dir')}")
+    print(f"DEBUG database existe: {spark.catalog.databaseExists(f'{GLUE_DATABASE_NAME}')}")
+    print(f"DEBUG tabela existe: {spark.catalog.tableExists(f'{GLUE_DATABASE_NAME}_db.silver_alunos_curado')}")
+    
+    try:
+        spark.sql(
+            f"CREATE TABLE IF NOT EXISTS `{GLUE_DATABASE_NAME}`.silver_alunos_curado USING DELTA LOCATION '{output_path}'"
+        )
+        print(f"  └─ ✅ Tabela Delta Silver registrada no Athena/Catalog ('{GLUE_DATABASE_NAME}.silver_alunos_curado')!")
+    except Exception as cat_err:
+        print(f"⚠️ Aviso ao registrar tabela no Catalog: {cat_err}")
 
     # 8. Salvando Manifesto da Camada Silver
     try:

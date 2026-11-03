@@ -14,6 +14,9 @@ import time
 import shutil
 import tempfile
 import datetime
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 import boto3
 import pandas as pd
 from dotenv import load_dotenv
@@ -30,6 +33,68 @@ FULL_BUCKET_NAME = f"{S3_BUCKET_NAME}-{AWS_ACCOUNT_ID}-{AWS_REGION}"
 POLLING_INTERVAL_SECONDS = int(os.getenv("GLUE_POLLING_INTERVAL", "10"))
 
 
+def send_failure_email_notification(pipeline_type, job_name, run_id, error_message, report_path=None):
+    """
+    Envia e-mail de notificação de falha utilizando smtplib nativo do Python,
+    anexando os detalhes da falha e o relatório Markdown gerado.
+    """
+    smtp_server = os.getenv("SMTP_SERVER")
+    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+    smtp_user = os.getenv("SMTP_USER")
+    smtp_password = os.getenv("SMTP_PASSWORD")
+    notification_email = os.getenv("NOTIFICATION_EMAIL")
+
+    if not (smtp_server and smtp_user and smtp_password and notification_email):
+        print("ℹ️ Notificação por e-mail ignorada: Variáveis SMTP não configuradas no .env.")
+        return
+
+    subject = f"TC - EDUCAÇÃO: FALHA NA EXECUÇÃO DA PIPELINE [{pipeline_type.upper()}]"
+
+    report_content = ""
+    if report_path and os.path.exists(report_path):
+        try:
+            with open(report_path, "r", encoding="utf-8") as f:
+                report_content = f.read()
+        except Exception as r_err:
+            report_content = f"Não foi possível ler o relatório em {report_path}: {r_err}"
+
+    now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    body_text = f"""===============================================================================
+🚨 ALERTA DE CRITICAL FAILURE DA PIPELINE DE DADOS
+===============================================================================
+Pipeline      : {pipeline_type.upper()}
+AWS Glue Job  : {job_name}
+Run ID        : {run_id}
+Timestamp UTC : {now_utc}
+Status        : FAILED
+===============================================================================
+Mensagem do Erro / Causa Raiz:
+{error_message}
+
+===============================================================================
+📄 RELATÓRIO DE EXECUÇÃO DO JOB (MARKDOWN)
+===============================================================================
+{report_content if report_content else "Relatório não gerado ou indisponível."}
+"""
+
+    try:
+        msg = MIMEMultipart()
+        msg["From"] = smtp_user
+        msg["To"] = notification_email
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body_text, "plain", "utf-8"))
+
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.starttls()
+        server.login(smtp_user, smtp_password)
+        server.sendmail(smtp_user, notification_email, msg.as_string())
+        server.quit()
+        print(f"📧 E-mail de notificação de falha enviado com sucesso para: {notification_email}")
+    except Exception as mail_err:
+        print(f"⚠️ Alerta ao enviar e-mail de notificação: {mail_err}")
+
+
 def get_glue_client():
     """Inicializa o cliente boto3 do AWS Glue."""
     return boto3.client("glue", region_name=AWS_REGION)
@@ -39,6 +104,9 @@ def get_logs_client():
     """Inicializa o cliente boto3 do AWS CloudWatch Logs."""
     return boto3.client("logs", region_name=AWS_REGION)
 
+def get_s3_client():
+    """Inicializa o cliente boto3 do AWS S3."""
+    return boto3.client("s3", region_name=AWS_REGION)
 
 def _print_job_log_events(events, seen_event_ids, noise_indicators):
     for event in events:
@@ -71,11 +139,6 @@ def _fetch_and_print_job_logs(
         log_response.get("events", []), seen_event_ids, noise_indicators
     )
     return log_response.get("nextForwardToken")
-
-
-def get_s3_client():
-    """Inicializa o cliente boto3 do AWS S3."""
-    return boto3.client("s3", region_name=AWS_REGION)
 
 
 def sync_gold_features_locally():
@@ -166,17 +229,7 @@ def _complete_glue_job(
 
     execution_time = job_run.get("ExecutionTime", 0)
     dpu_seconds = job_run.get("DPUSeconds", 0)
-
-    print("\n--------------------------------------------------")
-    if status == "SUCCEEDED":
-        print(f"✅ Job {job_name} finalizou com SUCESSO!")
-    else:
-        error_message = job_run.get("ErrorMessage", "Sem detalhes adicionais.")
-        print(f"❌ ERRO CRÍTICO: Job {job_name} terminou com status: {status}")
-        print(f"   Detalhes: {error_message}")
-
-    print(f"📊 Duração: {execution_time}s | DPU-Segundos: {dpu_seconds}")
-    print("--------------------------------------------------")
+    report_path = None
 
     if generate_job_report:
         try:
@@ -186,6 +239,18 @@ def _complete_glue_job(
             print(
                 f"⚠️ Alerta: Falha ao gerar relatório para {job_name}: {str(rep_err)}\n"
             )
+
+    print("\n--------------------------------------------------")
+    if status == "SUCCEEDED":
+        print(f"✅ Job {job_name} finalizou com SUCESSO!")
+    else:
+        error_message = job_run.get("ErrorMessage", "Sem detalhes adicionais.")
+        print(f"❌ ERRO CRÍTICO: Job {job_name} terminou com status: {status}")
+        print(f"   Detalhes: {error_message}")
+        send_failure_email_notification("BATCH", job_name, run_id, error_message, report_path)
+
+    print(f"📊 Duração: {execution_time}s | DPU-Segundos: {dpu_seconds}")
+    print("--------------------------------------------------")
 
     return status
 
@@ -248,14 +313,16 @@ def run_glue_job(job_name: str) -> str:
             time.sleep(POLLING_INTERVAL_SECONDS)
 
     except Exception as e:
-        print(f"❌ Falha ao tentar disparar o Glue Job {job_name}: {str(e)}")
+        error_msg = f"Falha ao tentar disparar o Glue Job {job_name}: {str(e)}"
+        print(f"❌ {error_msg}")
+        send_failure_email_notification("BATCH", job_name, "N/A", error_msg, None)
         return "FAILED"
 
 
 def main():
     """Pipeline de Orquestração Sequencial das Camadas Medalhão."""
     print("=" * 60)
-    print("🚀 INICIANDO PIPELINE DE ORQUESTRACAO...")
+    print("🚀 INICIANDO PIPELINE DE ORQUESTRACAO BATCH...")
     print("=" * 60)
 
     # 1. Execução da Camada Bronze

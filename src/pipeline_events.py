@@ -17,6 +17,9 @@ import shutil
 import tempfile
 import argparse
 import datetime
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from dotenv import load_dotenv
 
 try:
@@ -35,6 +38,7 @@ try:
 except ImportError:
     generate_job_report = None
 
+from dotenv import load_dotenv
 load_dotenv(override=True)
 
 AWS_REGION = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
@@ -49,6 +53,68 @@ else:
 POLLING_INTERVAL_SECONDS = int(os.getenv("GLUE_POLLING_INTERVAL", "10"))
 EVENTS_JOB_NAME = "04_events_processor"
 GOLD_JOB_NAME = "03_gold_aggregation"
+
+
+def send_failure_email_notification(pipeline_type, job_name, run_id, error_message, report_path=None):
+    """
+    Envia e-mail de notificação de falha utilizando smtplib nativo do Python,
+    anexando os detalhes da falha e o relatório Markdown gerado.
+    """
+    smtp_server = os.getenv("SMTP_SERVER")
+    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+    smtp_user = os.getenv("SMTP_USER")
+    smtp_password = os.getenv("SMTP_PASSWORD")
+    notification_email = os.getenv("NOTIFICATION_EMAIL")
+
+    if not (smtp_server and smtp_user and smtp_password and notification_email):
+        print("ℹ️ Notificação por e-mail ignorada: Variáveis SMTP não configuradas no .env.")
+        return
+
+    subject = f"TC - EDUCAÇÃO: FALHA NA EXECUÇÃO DA PIPELINE [{pipeline_type.upper()}]"
+
+    report_content = ""
+    if report_path and os.path.exists(report_path):
+        try:
+            with open(report_path, "r", encoding="utf-8") as f:
+                report_content = f.read()
+        except Exception as r_err:
+            report_content = f"Não foi possível ler o relatório em {report_path}: {r_err}"
+
+    now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    body_text = f"""===============================================================================
+🚨 ALERTA DE CRITICAL FAILURE DA PIPELINE DE DADOS (EVENTS STREAMING)
+===============================================================================
+Pipeline      : {pipeline_type.upper()}
+AWS Glue Job  : {job_name}
+Run ID        : {run_id}
+Timestamp UTC : {now_utc}
+Status        : FAILED
+===============================================================================
+Mensagem do Erro / Causa Raiz:
+{error_message}
+
+===============================================================================
+📄 RELATÓRIO DE EXECUÇÃO DO JOB (MARKDOWN)
+===============================================================================
+{report_content if report_content else "Relatório não gerado ou indisponível."}
+"""
+
+    try:
+        msg = MIMEMultipart()
+        msg["From"] = smtp_user
+        msg["To"] = notification_email
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body_text, "plain", "utf-8"))
+
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.starttls()
+        server.login(smtp_user, smtp_password)
+        server.sendmail(smtp_user, notification_email, msg.as_string())
+        server.quit()
+        print(f"📧 E-mail de notificação de falha enviado com sucesso para: {notification_email}")
+    except Exception as mail_err:
+        print(f"⚠️ Alerta ao enviar e-mail de notificação: {mail_err}")
 
 
 def get_s3_client():
@@ -176,17 +242,7 @@ def run_glue_job(job_name: str) -> str:
                 execution_time = job_run.get("ExecutionTime", 0)
                 dpu_seconds = job_run.get("DPUSeconds", 0)
 
-                print("\n--------------------------------------------------")
-                if status == "SUCCEEDED":
-                    print(f"✅ Job {job_name} finalizou com SUCESSO!")
-                else:
-                    error_message = job_run.get("ErrorMessage", "Sem detalhes adicionais.")
-                    print(f"❌ ERRO CRÍTICO: Job {job_name} terminou com status: {status}")
-                    print(f"   Detalhes: {error_message}")
-
-                print(f"📊 Duração: {execution_time}s | DPU-Segundos: {dpu_seconds}")
-                print("--------------------------------------------------")
-
+                report_path = None
                 if generate_job_report:
                     try:
                         report_path = generate_job_report(job_name, run_id)
@@ -194,12 +250,25 @@ def run_glue_job(job_name: str) -> str:
                     except Exception as rep_err:
                         print(f"⚠️ Alerta: Falha ao gerar relatório para {job_name}: {rep_err}\n")
 
+                print("\n--------------------------------------------------")
+                if status == "SUCCEEDED":
+                    print(f"✅ Job {job_name} finalizou com SUCESSO!")
+                else:
+                    error_message = job_run.get("ErrorMessage", "Sem detalhes adicionais.")
+                    print(f"❌ ERRO CRÍTICO: Job {job_name} terminou com status: {status}")
+                    print(f"   Detalhes: {error_message}")
+                    send_failure_email_notification("EVENTS", job_name, run_id, error_message, report_path)
+
+                print(f"📊 Duração: {execution_time}s | DPU-Segundos: {dpu_seconds}")
+                print("--------------------------------------------------")
+
                 return status
 
             time.sleep(POLLING_INTERVAL_SECONDS)
 
     except Exception as e:
         print(f"⚠️ Não foi possível rodar o Glue Job {job_name} na AWS ({e}). Tentando fallback local...")
+        print(f"⚠️ {error_msg}")
         return run_local_script_fallback(job_name)
 
 
@@ -224,7 +293,11 @@ def run_local_script_fallback(job_name: str) -> str:
 
     print(f"🔄 Executando script local: {script_path}")
     res = subprocess.run([sys.executable, script_path])
-    return "SUCCEEDED" if res.returncode == 0 else "FAILED"
+    res_status = "SUCCEEDED" if res.returncode == 0 else "FAILED"
+    if res_status == "FAILED":
+        send_failure_email_notification("EVENTS", job_name, "local_fallback", f"Falha na execução local do script {script_path}", None)
+    return res_status
+    
 
 
 def sync_gold_features_locally():

@@ -1,6 +1,6 @@
 """
 ===============================================================================
-SCRIPT DE DEPLOY DE INFRAESTRUTURA E ARTEFATOS AWS (src/infra/deploy_aws_scripts.py)
+SCRIPT DE DEPLOY DE INFRAESTRUTURA E ARTEFATOS AWS (src/infra/deploy_aws_setup.py)
 ===============================================================================
 Descrição: Deploy completo de infraestrutura e artefatos na AWS.
 Destaques:
@@ -23,6 +23,7 @@ import tempfile
 import boto3
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
+from cloudwatch_dashboard import setup_cloudwatch_dashboard
 
 # Carrega as variáveis de ambiente do arquivo .env local
 load_dotenv(override=True)
@@ -37,6 +38,9 @@ if AWS_ACCOUNT_ID and AWS_ACCOUNT_ID not in raw_bucket_name:
     S3_BUCKET = f"{raw_bucket_name}-{AWS_ACCOUNT_ID}-{AWS_REGION}"
 else:
     S3_BUCKET = raw_bucket_name
+
+# Tempo de expiração dos eventos processados na camada bronze
+LIFECYCLE_RULES_EXPIRATION_DAYS = os.getenv("LIFECYCLE_RULES_EXPIRATION_DAYS", 7)
 
 # Construção da Role ARN do AWS Glue
 raw_glue_role = os.getenv("AWS_GLUE_ROLE_ARN", "LabRole")
@@ -60,6 +64,7 @@ if not S3_BUCKET:
 s3_client = boto3.client("s3", region_name=AWS_REGION)
 glue_client = boto3.client("glue", region_name=AWS_REGION)
 sm_client = boto3.client("secretsmanager", region_name=AWS_REGION)
+cw_client = boto3.client("cloudwatch", region_name=AWS_REGION)
 
 SCRIPTS_TO_DEPLOY = [
     {
@@ -91,6 +96,8 @@ SCRIPTS_TO_DEPLOY = [
 
 BIGQUERY_JAR_URL = "https://repo1.maven.org/maven2/com/google/cloud/spark/spark-bigquery-with-dependencies_2.12/0.34.0/spark-bigquery-with-dependencies_2.12-0.34.0.jar"
 LOCAL_JAR_NAME = "spark-bigquery-with-dependencies_2.12-0.34.0.jar"
+DASHBOARD_NAME = f"{raw_bucket_name}-Observability-Dashboard"
+GLUE_DATABASE_NAME = f"{raw_bucket_name}_db"
 
 
 def setup_gcp_secret():
@@ -158,8 +165,36 @@ def _bucket_is_available():
         return True
 
 
+def setup_s3_lifecycle_rules():
+    """
+    Configura a Regra de Ciclo de Vida do S3 (Lifecycle Rule) para expirar/deletar
+    automaticamente os arquivos da Landing Zone (bronze/events_raw_landing/) após X dias.
+    """
+    print(f"\n♻️ Configurando S3 Lifecycle Rule para Landing Zone em 's3://{S3_BUCKET}'...")
+    lifecycle_config = {
+        "Rules": [
+            {
+                "ID": "ExpireRawLandingZoneEventsAfter7Days",
+                "Status": "Enabled",
+                "Filter": {
+                    "Prefix": "bronze/events_raw_landing/"
+                },
+                "Expiration": {
+                    "Days": int(LIFECYCLE_RULES_EXPIRATION_DAYS)
+                }
+            }
+        ]
+    }
+    try:
+        s3_client.put_bucket_lifecycle_configuration(
+            Bucket=S3_BUCKET,
+            LifecycleConfiguration=lifecycle_config
+        )
+        print(f"  └─ ✅ Regra de Expiração S3 criada/atualizada: 'bronze/events_raw_landing/' (Expiração: {LIFECYCLE_RULES_EXPIRATION_DAYS} Dias).")
+    except Exception as err:
+        print(f"  └─ ⚠️ Aviso ao configurar S3 Lifecycle Rule: {err}")
+
 def _configure_bucket_security():
-    setup_s3_lifecycle_rules()
     try:
         s3_client.put_bucket_ownership_controls(
             Bucket=S3_BUCKET,
@@ -203,36 +238,6 @@ def _configure_bucket_security():
     except Exception as error:
         print(f"     └─ ⚠️ Aviso em Criptografia: {str(error)}")
 
-def setup_s3_lifecycle_rules():
-    """
-    Configura a Regra de Ciclo de Vida do S3 (Lifecycle Rule) para expirar/deletar
-    automaticamente os arquivos da Landing Zone (bronze/events_raw_landing/) após 7 dias.
-    Isso garante limpeza automatizada sem depender de intervenção manual ou scripts.
-    """
-    print(f"\n♻️ Configurando S3 Lifecycle Rule para Landing Zone em 's3://{S3_BUCKET}'...")
-    lifecycle_config = {
-        "Rules": [
-            {
-                "ID": "ExpireRawLandingZoneEventsAfter7Days",
-                "Status": "Enabled",
-                "Filter": {
-                    "Prefix": "bronze/events_raw_landing/"
-                },
-                "Expiration": {
-                    "Days": 7
-                }
-            }
-        ]
-    }
-    try:
-        s3_client.put_bucket_lifecycle_configuration(
-            Bucket=S3_BUCKET,
-            LifecycleConfiguration=lifecycle_config
-        )
-        print("  └─ ✅ Regra de Expiração S3 criada/atualizada: 'bronze/events_raw_landing/' (Expiração: 7 Dias).")
-    except Exception as err:
-        print(f"  └─ ⚠️ Aviso ao configurar S3 Lifecycle Rule: {err}")
-
 def prepare_and_create_s3_bucket():
     """
     2. Checa se o Bucket S3 existe. Se não existir, cria um novo seguindo
@@ -266,6 +271,31 @@ def prepare_and_create_s3_bucket():
 
     _configure_bucket_security()
     setup_s3_lifecycle_rules()
+
+
+def setup_glue_catalog_database():
+    """
+    3. Provisiona o Database 'tc_educacao_db' no AWS Glue Data Catalog
+       para permitir o registro automático de tabelas e consulta imediata via Amazon Athena.
+    """
+    print(f"\n🗄️ 3. Provisionando Glue Data Catalog Database ('{GLUE_DATABASE_NAME}')...")
+    try:
+        glue_client.create_database(
+            DatabaseInput={
+                "Name": GLUE_DATABASE_NAME,
+                "Description": (
+                    "Database catalogado do Data Lake "
+                    "Medalhão - Compromisso Nacional "
+                    "Criança Alfabetizada"
+                ),
+                "LocationUri": f"s3://{S3_BUCKET}/",
+            }
+        )
+        print(f"  └─ ✅ Database '{GLUE_DATABASE_NAME}' criado com sucesso no Glue Catalog.")
+    except glue_client.exceptions.AlreadyExistsException:
+        print(f"  └─ ℹ️ Database '{GLUE_DATABASE_NAME}' já existe no Glue Catalog.")
+    except Exception as err:
+        print(f"  └─ ⚠️ Aviso ao provisionar Database no Glue Catalog: {err}")
 
 
 def _upload_connector_jar(s3_jar_key):
@@ -305,10 +335,13 @@ def _register_glue_job(item, extra_py_files, extra_jars, additional_modules):
             "--extra-jars": extra_jars,
             "--additional-python-modules": additional_modules,
             "--datalake-formats": "delta",
+            "--enable-glue-datacatalog": "true",
             "--S3_BUCKET_NAME": S3_BUCKET,
+            "--GLUE_DATABASE_NAME": GLUE_DATABASE_NAME,
             "--TempDir": f"s3://{S3_BUCKET}/temp/",
             "--enable-metrics": "true",
             "--enable-continuous-cloudwatch-log": "true",
+            "--enable-observability-metrics": "true",
             "--conf": "spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog",
         },
         "GlueVersion": "4.0",
@@ -328,9 +361,49 @@ def _register_glue_job(item, extra_py_files, extra_jars, additional_modules):
         print(f"  └─ ⚠️ Erro ao registrar/atualizar Glue Job {job_name}: {job_err}")
 
 
+def setup_cloudwatch_alarms():
+    """
+    6. Provisiona CloudWatch Alarms para monitorar falhas nos 4 Glue Jobs.
+    """
+    print("\n🚨 6. Provisionando Alertas do CloudWatch para os Glue Jobs...")
+
+    glue_jobs = [
+        "01_bronze_ingestion",
+        "02_silver_processing",
+        "03_gold_aggregation",
+        "04_events_processor",
+    ]
+
+    for job in glue_jobs:
+        alarm_name = f"{raw_bucket_name}-GlueJobFailure-{job}"
+        try:
+            cw_client.put_metric_alarm(
+                AlarmName=alarm_name,
+                AlarmDescription=f"Alerta de falha ou erro crítico no AWS Glue Job '{job}'.",
+                ActionsEnabled=True,
+                MetricName="glue.error.ALL",
+                Namespace="Glue",
+                Dimensions=[
+                    {"Name": "JobName", "Value": job},
+                    {"Name": "JobRunId", "Value": "ALL"},
+                    {"Name": "Type", "Value": "count"},
+                    {"Name": "ObservabilityGroup", "Value": "error"},
+                ],
+                Statistic="Sum",
+                Period=300,
+                EvaluationPeriods=1,
+                Threshold=1.0,
+                ComparisonOperator="GreaterThanOrEqualToThreshold",
+                TreatMissingData="notBreaching"
+            )
+            print(f"  └─ 🔔 Alarme CloudWatch configurado: '{alarm_name}'")
+        except Exception as a_err:
+            print(f"  └─ ⚠️ Alerta ao configurar alarme para {job}: {a_err}")
+
+
 def deploy_artifacts_and_jobs():
-    """2 & 3. Empacota artefatos no S3 e registra Glue Jobs com --additional-python-modules."""
-    print(f"\n📤 2. Processando artefatos e enviando para s3://{S3_BUCKET}/...")
+    """4. Empacota artefatos no S3 e registra Glue Jobs no Catalog."""
+    print(f"\n📤 4. Processando artefatos e enviando para s3://{S3_BUCKET}/...")
 
     # Upload dos scripts Python locais
     for item in SCRIPTS_TO_DEPLOY:
@@ -345,8 +418,8 @@ def deploy_artifacts_and_jobs():
     s3_jar_key = f"libs/{LOCAL_JAR_NAME}"
     _upload_connector_jar(s3_jar_key)
 
-    # 4. Registro / Atualização dos Glue Jobs no Catalog
-    print("\n⚙️ 3. Registrando / Atualizando Glue Jobs no AWS Catalog...")
+    # Registro / Atualização dos Glue Jobs no Catalog
+    print("\n⚙️ 5. Registrando / Atualizando Glue Jobs no AWS Catalog...")
 
     extra_py_files = f"s3://{S3_BUCKET}/scripts/common/quality_lib.py"
     extra_jars = f"s3://{S3_BUCKET}/{s3_jar_key}"
@@ -367,21 +440,33 @@ def main():
     print(f"ℹ️ Região Padrão: {AWS_REGION}")
     print(f"ℹ️ Bucket S3 Alvo: s3://{S3_BUCKET}")
     print(f"ℹ️ Role Glue ARN: {GLUE_ROLE_ARN}")
+    print(f"ℹ️ Database Glue Catalog: {GLUE_DATABASE_NAME}")
     print("-" * 75)
 
     setup_gcp_secret()
     prepare_and_create_s3_bucket()
+    setup_glue_catalog_database()
     deploy_artifacts_and_jobs()
+    setup_cloudwatch_dashboard(
+        cw_client=cw_client,
+        aws_region=AWS_REGION,
+        aws_account_id=AWS_ACCOUNT_ID,
+        raw_bucket_name=raw_bucket_name,
+        jobs=[item['job_name'] for item in SCRIPTS_TO_DEPLOY
+              if item['job_name']],
+        dashboard_name=DASHBOARD_NAME,
+    )
+    setup_cloudwatch_alarms()
 
     print("\n" + "=" * 75)
     print("✅ DEPLOY CONCLUÍDO COM SUCESSO!")
     print(f"   🔒 Secret no Secrets Manager: '{SECRET_NAME}'")
-    print(f"   🪣 Bucket S3 verificado/criado com segurança: 's3://{S3_BUCKET}'")
-    print(
-        "   📦 Módulos Python e JARs configurados via --additional-python-modules e /libs/"
-    )
+    print(f"   🪣 Bucket S3 e Lifecycle Rule : 's3://{S3_BUCKET}' (Expiração: {LIFECYCLE_RULES_EXPIRATION_DAYS} dias)")
+    print(f"   🗄️ Database no Glue Catalog: '{GLUE_DATABASE_NAME}'")
+    print(f"   📊 Dashboard de Observabilidade: '{DASHBOARD_NAME}'")
+    print("   🚨 Alarmes CloudWatch ativados para os 4 Glue Jobs")
+    print("   📦 Módulos Python, JARs e --enable-glue-datacatalog configurados no AWS Catalog")
     print("   🔺 Suporte ao Delta Lake habilitado via --datalake-formats delta")
-    print("   🧹 Repositório local 100% limpo (Zero arquivos temporários mantidos)")
     print("=" * 75)
 
 

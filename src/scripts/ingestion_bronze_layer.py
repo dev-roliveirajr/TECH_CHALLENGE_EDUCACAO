@@ -151,7 +151,7 @@ ENTITIES = [
 
 
 def load_bigquery_table(table_id):
-    """Carrega a tabela do BigQuery via Spark Connector com credenciais Base64 In-Memory (ou SDK Fallback)."""
+    """Carrega a tabela do BigQuery via Spark Connector."""
     try:
         reader = spark.read.format("bigquery").option("table", table_id)
         if gcp_project_id:
@@ -159,15 +159,9 @@ def load_bigquery_table(table_id):
         if gcp_b64_credentials:
             reader = reader.option("credentials", gcp_b64_credentials)
         return reader.load()
-    except Exception as spark_err:
-        print(f"   ⚠️ Spark BigQuery Connector falhou para {table_id}: {spark_err}")
-        print("   🔄 Executando leitura via Google BigQuery SDK (In-Memory)...")
-        query_job = bq_client.query(f"SELECT * FROM `{table_id}`")
-        results = list(query_job.result())
-        if not results:
-            raise ValueError(f"A tabela '{table_id}' retornou 0 registros no BigQuery.")
-        rows = [dict(row.items()) for row in results]
-        return spark.createDataFrame(rows)
+    except Exception as e:
+        print(f"   ⚠️ Spark BigQuery Connector falhou para {table_id}: {e}")
+        raise
 
 
 def process_entity(entity):
@@ -178,7 +172,7 @@ def process_entity(entity):
     )
 
     try:
-        # Metadados instantâneos sem scan (Zero Cost)
+        # Metadados BigQuery
         table_meta = bq_client.get_table(table_id)
         mod_time = table_meta.modified
         num_rows = getattr(table_meta, "num_rows", -1)
@@ -205,7 +199,7 @@ def process_entity(entity):
                 "entity": entity,
                 "bq_rows": num_rows,
                 "s3_rows": 0,
-                "size_mb": round(size_mb, 2),
+                "size_mb": 0,
                 "status": "SKIPPED (Already Up-to-Date)",
                 "partitions": 0,
                 "s3_prefix": f"s3://{S3_BUCKET}/{s3_partition_prefix}",

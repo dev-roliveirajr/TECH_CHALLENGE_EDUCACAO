@@ -31,7 +31,7 @@ test:
 	pytest --cov=src tests/
 
 aws:
-	python src/infra/deploy_aws_scripts.py
+	python src/infra/deploy_aws_setup.py
 
 events:
 	python src/generators/generate_alunos_events.py -n $$(python -c "import random; print(random.randint(1, 50))")
