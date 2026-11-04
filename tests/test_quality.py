@@ -98,7 +98,7 @@ def test_check_join_ratio_failure_raises_exception():
             raise_on_failure=True,
         )
 
-    assert "FALHA BLOQUEANTE DE QUALIDADE" in str(exc_info.value)
+    assert "abaixo do limiar definido" in str(exc_info.value)
     assert "80.00%" in str(exc_info.value)
 
 

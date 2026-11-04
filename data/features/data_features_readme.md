@@ -1,29 +1,37 @@
 # 📂 Datasets Analíticos e Feature Store — Camada Gold
 
-Esta pasta armazena os datasets consolidados da **Camada Gold** gerados pelo pipeline de ETL do Data Lake Medalhão (**Tech Challenge - Fase 2**).
+Esta pasta armazena os conjuntos de dados consolidados da **Camada Gold**.
 
 Os dados estão persistidos em arquivo único no formato **Apache Parquet (Snappy)**, otimizados para leitura em Pandas, PySpark, Polars ou DuckDB.
 
 ---
 
-## 📊 Datasets Disponíveis
+##  Datasets Disponíveis
 
-### 1. `gold_features_alfabetizacao.parquet`
-* **Finalidade**: Matriz de características (*Feature Store*) para o treinamento dos modelos preditivos de Machine Learning na **Fase 3**.
-* **Nível de Agregação**: Ente federativo / Município.
-* **Governança**: Estrutura imune a vazamento de alvo (*target leakage*).
+### Indicadores
+* `gold_indicadores_municipais.parquet`: indicadores por município, rede, ano e série.
+* `gold_indicadores_uf.parquet`: indicadores por UF, rede, ano e série.
+* `gold_indicadores_brasil.parquet`: indicadores nacionais por rede, ano e série.
 
-### 2. `gold_indicadores_municipais.parquet`
-* **Finalidade**: Tabela de indicadores educacionais recalculados a partir dos microdados individuais dos estudantes do Saeb.
-* **Métrica Principal**: Taxa de alfabetização ponderada pelo peso amostral (`peso_aluno`).
+As taxas são calculadas diretamente dos microdados com ponderação por
+`peso_aluno`. Os indicadores incluem todas as redes disponíveis.
 
-### 3. `gold_desempenho_vs_metas.parquet`
-* **Finalidade**: Análise comparativa da taxa apurada contra a **Meta Pactuada Oficial da Fonte** (trajetória até 80,0% em 2030).
-* **Categorização**: `Atingiu a Meta`, `Não Atingiu a Meta` e `Sem Meta Cadastrada`.
+### Feature Stores por nível geográfico
+* `gold_features_alfabetizacao.parquet`: features e rótulo-alvo municipais.
+* `gold_features_alfabetizacao_uf.parquet`: features e rótulo-alvo estaduais.
+* `gold_features_alfabetizacao_brasil.parquet`: features e rótulo-alvo nacionais.
+
+### Comparativos com a meta oficial
+* `gold_desempenho_vs_metas.parquet`: municípios, rede `"3"` (Municipal).
+* `gold_desempenho_vs_metas_uf.parquet`: UFs, rede `"5"` (Pública estadual e municipal).
+* `gold_desempenho_vs_metas_brasil.parquet`: Brasil, rede `"5"`.
+
+Os comparativos contêm `gap_para_meta` e `status_meta`, ambos relativos à meta
+oficial de 80%. Não há meta aspiracional.
 
 ---
 
-## 💻 Exemplo de Consumo no Python
+##  Exemplo de Consumo no Python
 
 ### Usando Pandas (Ideal para Machine Learning)
 ```python

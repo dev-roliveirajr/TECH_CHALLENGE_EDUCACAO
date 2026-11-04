@@ -33,7 +33,9 @@ FULL_BUCKET_NAME = f"{S3_BUCKET_NAME}-{AWS_ACCOUNT_ID}-{AWS_REGION}"
 POLLING_INTERVAL_SECONDS = int(os.getenv("GLUE_POLLING_INTERVAL", "10"))
 
 
-def send_failure_email_notification(pipeline_type, job_name, run_id, error_message, report_path=None):
+def send_failure_email_notification(
+    pipeline_type, job_name, run_id, error_message, report_path=None
+):
     """
     Envia e-mail de notificação de falha utilizando smtplib nativo do Python,
     anexando os detalhes da falha e o relatório Markdown gerado.
@@ -45,7 +47,9 @@ def send_failure_email_notification(pipeline_type, job_name, run_id, error_messa
     notification_email = os.getenv("NOTIFICATION_EMAIL")
 
     if not (smtp_server and smtp_user and smtp_password and notification_email):
-        print("ℹ️ Notificação por e-mail ignorada: Variáveis SMTP não configuradas no .env.")
+        print(
+            " Notificação por e-mail ignorada: Variáveis SMTP não configuradas no .env."
+        )
         return
 
     subject = f"TC - EDUCAÇÃO: FALHA NA EXECUÇÃO DA PIPELINE [{pipeline_type.upper()}]"
@@ -56,12 +60,16 @@ def send_failure_email_notification(pipeline_type, job_name, run_id, error_messa
             with open(report_path, "r", encoding="utf-8") as f:
                 report_content = f.read()
         except Exception as r_err:
-            report_content = f"Não foi possível ler o relatório em {report_path}: {r_err}"
+            report_content = (
+                f"Não foi possível ler o relatório em {report_path}: {r_err}"
+            )
 
-    now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    now_utc = datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%d %H:%M:%S UTC"
+    )
 
     body_text = f"""===============================================================================
-🚨 ALERTA DE CRITICAL FAILURE DA PIPELINE DE DADOS
+ ALERTA DE CRITICAL FAILURE DA PIPELINE DE DADOS
 ===============================================================================
 Pipeline      : {pipeline_type.upper()}
 AWS Glue Job  : {job_name}
@@ -73,7 +81,7 @@ Mensagem do Erro / Causa Raiz:
 {error_message}
 
 ===============================================================================
-📄 RELATÓRIO DE EXECUÇÃO DO JOB (MARKDOWN)
+ RELATÓRIO DE EXECUÇÃO DO JOB (MARKDOWN)
 ===============================================================================
 {report_content if report_content else "Relatório não gerado ou indisponível."}
 """
@@ -90,9 +98,9 @@ Mensagem do Erro / Causa Raiz:
         server.login(smtp_user, smtp_password)
         server.sendmail(smtp_user, notification_email, msg.as_string())
         server.quit()
-        print(f"📧 E-mail de notificação de falha enviado com sucesso para: {notification_email}")
+        print(f" E-mail de notificação de falha enviado  para: {notification_email}")
     except Exception as mail_err:
-        print(f"⚠️ Alerta ao enviar e-mail de notificação: {mail_err}")
+        print(f" Alerta ao enviar e-mail de notificação: {mail_err}")
 
 
 def get_glue_client():
@@ -104,9 +112,11 @@ def get_logs_client():
     """Inicializa o cliente boto3 do AWS CloudWatch Logs."""
     return boto3.client("logs", region_name=AWS_REGION)
 
+
 def get_s3_client():
     """Inicializa o cliente boto3 do AWS S3."""
     return boto3.client("s3", region_name=AWS_REGION)
+
 
 def _print_job_log_events(events, seen_event_ids, noise_indicators):
     for event in events:
@@ -146,12 +156,18 @@ def sync_gold_features_locally():
     Sincroniza e consolida os datasets Parquet da Camada Gold do S3 para a pasta local
     'data/features/', unificando as partições dispersas em arquivos .parquet únicos:
       - data/features/gold_features_alfabetizacao.parquet
+      - data/features/gold_features_alfabetizacao_uf.parquet
+      - data/features/gold_features_alfabetizacao_brasil.parquet
       - data/features/gold_indicadores_municipais.parquet
+      - data/features/gold_indicadores_uf.parquet
+      - data/features/gold_indicadores_brasil.parquet
       - data/features/gold_desempenho_vs_metas.parquet
+      - data/features/gold_desempenho_vs_metas_uf.parquet
+      - data/features/gold_desempenho_vs_metas_brasil.parquet
     """
     print("\n--------------------------------------------------")
     print(
-        "🔄 Sincronizando e consolidando datasets Gold localmente em 'data/features/'..."
+        " Sincronizando e consolidando datasets Gold localmente em 'data/features/'..."
     )
     print("--------------------------------------------------")
 
@@ -161,27 +177,32 @@ def sync_gold_features_locally():
 
     gold_datasets = {
         "gold_features_alfabetizacao": "gold/gold_features_alfabetizacao/",
+        "gold_features_alfabetizacao_uf": "gold/gold_features_alfabetizacao_uf/",
+        "gold_features_alfabetizacao_brasil": "gold/gold_features_alfabetizacao_brasil/",
         "gold_indicadores_municipais": "gold/gold_indicadores_municipais/",
+        "gold_indicadores_uf": "gold/gold_indicadores_uf/",
+        "gold_indicadores_brasil": "gold/gold_indicadores_brasil/",
         "gold_desempenho_vs_metas": "gold/gold_desempenho_vs_metas/",
+        "gold_desempenho_vs_metas_uf": "gold/gold_desempenho_vs_metas_uf/",
+        "gold_desempenho_vs_metas_brasil": "gold/gold_desempenho_vs_metas_brasil/",
     }
 
     for dataset_name, s3_prefix in gold_datasets.items():
         temp_dir = tempfile.mkdtemp()
         try:
-            resp = s3_client.list_objects_v2(Bucket=FULL_BUCKET_NAME, Prefix=s3_prefix)
-            if "Contents" not in resp:
-                print(f"⚠️ Aviso: Prefixo {s3_prefix} não encontrado no S3.")
-                continue
-
+            paginator = s3_client.get_paginator("list_objects_v2")
             parquet_keys = [
                 obj["Key"]
-                for obj in resp["Contents"]
+                for page in paginator.paginate(
+                    Bucket=FULL_BUCKET_NAME,
+                    Prefix=s3_prefix,
+                )
+                for obj in page.get("Contents", [])
                 if obj["Key"].endswith(".parquet")
                 and not obj["Key"].split("/")[-1].startswith(".")
             ]
-
             if not parquet_keys:
-                print(f"⚠️ Aviso: Nenhum arquivo Parquet encontrado em {s3_prefix}.")
+                print(f" Aviso: Nenhum arquivo Parquet encontrado em {s3_prefix}.")
                 continue
 
             # Baixa as partes do S3 para o diretório temporário
@@ -199,11 +220,11 @@ def sync_gold_features_locally():
             target_file_path = os.path.join(local_output_dir, f"{dataset_name}.parquet")
             df_consolidated.to_parquet(target_file_path, index=False)
             print(
-                f"  └─ ✅ Dataset consolidado salvo com sucesso: {target_file_path} ({len(df_consolidated):,} linhas)"
+                f"  └─  Dataset consolidado salvo : {target_file_path} ({len(df_consolidated):,} linhas)"
             )
 
         except Exception as e:
-            print(f"⚠️ Alerta: Falha ao sincronizar {dataset_name}: {str(e)}")
+            print(f" Alerta: Falha ao sincronizar {dataset_name}: {str(e)}")
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -234,22 +255,24 @@ def _complete_glue_job(
     if generate_job_report:
         try:
             report_path = generate_job_report(job_name, run_id)
-            print(f"📄 Relatório FinOps gerado com sucesso: {report_path}\n")
+            print(f" Relatório salvo: {report_path}\n")
         except Exception as rep_err:
             print(
-                f"⚠️ Alerta: Falha ao gerar relatório para {job_name}: {str(rep_err)}\n"
+                f" Alerta: Falha ao gerar relatório para {job_name}: {str(rep_err)}\n"
             )
 
     print("\n--------------------------------------------------")
     if status == "SUCCEEDED":
-        print(f"✅ Job {job_name} finalizou com SUCESSO!")
+        print(f"Job {job_name} concluído.")
     else:
         error_message = job_run.get("ErrorMessage", "Sem detalhes adicionais.")
-        print(f"❌ ERRO CRÍTICO: Job {job_name} terminou com status: {status}")
+        print(f" Erro: Job {job_name} terminou com status: {status}")
         print(f"   Detalhes: {error_message}")
-        send_failure_email_notification("BATCH", job_name, run_id, error_message, report_path)
+        send_failure_email_notification(
+            "BATCH", job_name, run_id, error_message, report_path
+        )
 
-    print(f"📊 Duração: {execution_time}s | DPU-Segundos: {dpu_seconds}")
+    print(f" Duração: {execution_time}s | DPU-Segundos: {dpu_seconds}")
     print("--------------------------------------------------")
 
     return status
@@ -265,15 +288,13 @@ def run_glue_job(job_name: str) -> str:
     glue_client = get_glue_client()
     logs_client = get_logs_client()
 
-    print(f"\n🚀 Disparando AWS Glue Job: {job_name}")
+    print(f"\n Disparando AWS Glue Job: {job_name}")
 
     try:
         response = glue_client.start_job_run(JobName=job_name)
         run_id = response["JobRunId"]
-        print(f"📌 JobRunId gerado: {run_id}")
-        print(
-            "📡 Acompanhando logs em tempo real (CloudWatch /aws-glue/jobs/output):\n"
-        )
+        print(f" JobRunId gerado: {run_id}")
+        print(" Acompanhando logs em tempo real (CloudWatch /aws-glue/jobs/output):\n")
 
         next_token = None
         seen_event_ids = set()
@@ -314,7 +335,7 @@ def run_glue_job(job_name: str) -> str:
 
     except Exception as e:
         error_msg = f"Falha ao tentar disparar o Glue Job {job_name}: {str(e)}"
-        print(f"❌ {error_msg}")
+        print(f" {error_msg}")
         send_failure_email_notification("BATCH", job_name, "N/A", error_msg, None)
         return "FAILED"
 
@@ -322,45 +343,43 @@ def run_glue_job(job_name: str) -> str:
 def main():
     """Pipeline de Orquestração Sequencial das Camadas Medalhão."""
     print("=" * 60)
-    print("🚀 INICIANDO PIPELINE DE ORQUESTRACAO BATCH...")
+    print(" INICIANDO PIPELINE DE ORQUESTRACAO BATCH...")
     print("=" * 60)
 
     # 1. Execução da Camada Bronze
     print("\n" + "=" * 60)
-    print("🔄 Inicio da Ingestão de dados para a camada Bronze...")
+    print(" Inicio da Ingestão de dados para a camada Bronze...")
     print("=" * 60)
     status_bronze = run_glue_job("01_bronze_ingestion")
     if status_bronze != "SUCCEEDED":
-        print(
-            "\n🛑 PARADA DE EMERGÊNCIA: Camada Bronze falhou. Interrompendo pipeline."
-        )
+        print("\n Execução interrompida: Camada Bronze falhou. Interrompendo pipeline.")
         sys.exit(1)
 
     # 2. Execução da Camada Silver (Com validações de qualidade e JOINs)
     print("\n" + "=" * 60)
-    print("🔄 Inicio da Qualificação de dados para a camada Silver...")
+    print(" Inicio da Qualificação de dados para a camada Silver...")
     print("=" * 60)
     status_silver = run_glue_job("02_silver_processing")
     if status_silver != "SUCCEEDED":
         print(
-            "\n🛑 PARADA DE EMERGÊNCIA: Camada Silver falhou (validação de qualidade/JOINs). Interrompendo pipeline."
+            "\n Execução interrompida: Camada Silver falhou (validação de qualidade/JOINs). Interrompendo pipeline."
         )
         sys.exit(1)
 
     # 3. Execução da Camada Gold (KPIs e Feature Store para IA)
     print("\n" + "=" * 60)
-    print("🔄 Inicio da Agregação de dados para a camada Gold...")
+    print(" Inicio da Agregação de dados para a camada Gold...")
     print("=" * 60)
     status_gold = run_glue_job("03_gold_aggregation")
     if status_gold != "SUCCEEDED":
-        print("\n🛑 ALERTA: Camada Gold falhou.")
+        print("\n ALERTA: Camada Gold falhou.")
         sys.exit(1)
 
     # 4. Sincronização e consolidação local dos datasets da Gold em 'data/features/'
     sync_gold_features_locally()
 
     print("\n" + "=" * 60)
-    print("🎉 PIPELINE EXECUTADA COM SUCESSO EM TODAS AS CAMADAS!")
+    print("Pipeline concluído para todas as camadas.")
     print("=" * 60)
 
 

@@ -8,14 +8,25 @@ As métricas avançadas são publicadas no namespace Glue após habilitar
 
 import json
 
+from botocore.exceptions import ClientError
 
-def _metric(metric_name, job_name, metric_type="count",
-            observability_group=None, label=None, stat=None):
+
+def _metric(
+    metric_name,
+    job_name,
+    metric_type="count",
+    observability_group=None,
+    label=None,
+    stat=None,
+):
     """Monta uma definição de métrica CloudWatch com dimensões Glue."""
     dimensions = [
-        "JobName", job_name,
-        "JobRunId", "ALL",
-        "Type", metric_type,
+        "JobName",
+        job_name,
+        "JobRunId",
+        "ALL",
+        "Type",
+        metric_type,
     ]
     if observability_group:
         dimensions.extend(["ObservabilityGroup", observability_group])
@@ -31,9 +42,18 @@ def _metric(metric_name, job_name, metric_type="count",
     return metric
 
 
-def _metric_widget(title, metrics, x, y, width=12, height=6,
-                   stat="Sum", period=300, y_axis_label=None,
-                   y_axis_max=None):
+def _metric_widget(
+    title,
+    metrics,
+    x,
+    y,
+    width=12,
+    height=6,
+    stat="Sum",
+    period=300,
+    y_axis_label=None,
+    y_axis_max=None,
+):
     """Cria um widget de métricas CloudWatch."""
     properties = {
         "metrics": metrics,
@@ -80,15 +100,10 @@ def setup_cloudwatch_dashboard(
         jobs: lista com os nomes dos Glue Jobs.
         dashboard_name: nome opcional do dashboard.
     """
-    dashboard_name = dashboard_name or (
-        f"{raw_bucket_name}-Observability-Dashboard"
-    )
+    dashboard_name = dashboard_name or (f"{raw_bucket_name}-Observability-Dashboard")
     jobs = list(jobs)
 
-    print(
-        f"\n📊 Provisionando CloudWatch Dashboard "
-        f"('{dashboard_name}')..."
-    )
+    print(f"\n Provisionando CloudWatch Dashboard " f"('{dashboard_name}')...")
 
     # Métricas básicas agregadas por JobName + JobRunId=ALL + Type=count.
     elapsed_metrics = [
@@ -103,27 +118,20 @@ def setup_cloudwatch_dashboard(
         metric[-1]["id"] = f"duration{index}"
         metric[-1]["visible"] = False
 
-    elapsed_metrics.append([
-        {
-            "expression": "METRICS()/1000",
-            "label": "Duração (segundos)",
-            "id": "duration_seconds",
-            "period": 300,
-        }
-    ])
+    elapsed_metrics.append(
+        [
+            {
+                "expression": "METRICS()/1000",
+                "label": "Duração (segundos)",
+                "id": "duration_seconds",
+                "period": 300,
+            }
+        ]
+    )
 
     tasks_metrics = [
         _metric(
             "glue.driver.aggregate.numCompletedTasks",
-            job,
-            label=job,
-        )
-        for job in jobs
-    ]
-
-    failed_tasks_metrics = [
-        _metric(
-            "glue.driver.aggregate.numFailedTasks",
             job,
             label=job,
         )
@@ -231,55 +239,61 @@ def setup_cloudwatch_dashboard(
             "height": 3,
             "properties": {
                 "markdown": (
-                    "# 🚀 Observabilidade & FinOps — Pipeline Educação\n"
-                    "**AWS Glue | Performance | Throughput | Recursos | "
-                    "Confiabilidade**\n\n"
+                    "# Monitoramento do pipeline de dados\n"
+                    "**AWS Glue | Execução | Recursos**\n\n"
                     f"Região: `{aws_region}` · Bucket: "
                     f"`{raw_bucket_name}`"
                 )
             },
         },
         _metric_widget(
-            "⏱️ Duração ETL por Glue Job (segundos)",
+            "Duração ETL por Glue Job (segundos)",
             elapsed_metrics,
-            0, 3,
+            0,
+            3,
             y_axis_label="Segundos",
         ),
         _metric_widget(
-            "⚡ Tarefas Spark concluídas",
+            "Tarefas Spark concluídas",
             tasks_metrics,
-            12, 3,
+            12,
+            3,
         ),
         _metric_widget(
-            "📥 Volume de dados lidos (bytes)",
+            "Volume de dados lidos (bytes)",
             read_bytes_metrics,
-            0, 9,
+            0,
+            9,
             y_axis_label="Bytes",
         ),
         _metric_widget(
-            "📚 Registros lidos",
+            "Registros lidos",
             read_records_metrics,
-            12, 9,
+            12,
+            9,
         ),
         _metric_widget(
-            "📤 Bytes gravados no Amazon S3",
+            "Bytes gravados no Amazon S3",
             s3_write_bytes_metrics,
-            0, 15,
+            0,
+            15,
             stat="Sum",
             y_axis_label="Bytes",
         ),
         _metric_widget(
             "🧩 Utilização dos workers",
             worker_utilization_metrics,
-            12, 15,
+            12,
+            15,
             stat="Average",
             y_axis_label="Fração de utilização (0 a 1)",
             y_axis_max=1,
         ),
         _metric_widget(
-            "🧠 Memória heap dos executores utilizada (%)",
+            "Memória heap dos executores utilizada (%)",
             executor_memory_metrics,
-            0, 21,
+            0,
+            21,
             stat="Average",
             y_axis_label="Percentual",
             y_axis_max=100,
@@ -287,27 +301,31 @@ def setup_cloudwatch_dashboard(
         _metric_widget(
             "💽 Disco dos executores utilizado (%)",
             executor_disk_metrics,
-            12, 21,
+            12,
+            21,
             stat="Average",
             y_axis_label="Percentual",
             y_axis_max=100,
         ),
         _metric_widget(
-            "⚖️ Skewness por Glue Job",
+            "Skewness por Glue Job",
             skewness_metrics,
-            0, 33,
+            0,
+            33,
             stat="Maximum",
             y_axis_label="Índice de skewness",
         ),
         _metric_widget(
-            "🚨 Erros em execuções dos Glue Jobs",
+            "Erros em execuções dos Glue Jobs",
             run_errors_metrics,
-            12, 33,
+            12,
+            33,
         ),
         _metric_widget(
-            "✅ Execuções concluídas com sucesso",
+            "Execuções concluídas",
             run_success_metrics,
-            0, 39,
+            0,
+            39,
         ),
         {
             "type": "alarm",
@@ -316,7 +334,7 @@ def setup_cloudwatch_dashboard(
             "width": 24,
             "height": 4,
             "properties": {
-                "title": "🚨 Alarmes de falha dos Glue Jobs",
+                "title": "Alarmes de falha dos Glue Jobs",
                 "alarms": [
                     (
                         f"arn:aws:cloudwatch:{aws_region}:"
@@ -335,7 +353,7 @@ def setup_cloudwatch_dashboard(
             "height": 4,
             "properties": {
                 "markdown": (
-                    "### 💰 FinOps — leitura de capacidade\n"
+                    "### Capacidade e custo de execução\n"
                     "Configuração atual dos Jobs: **2 workers G.1X "
                     "(2 DPUs provisionadas por execução)**. "
                     "Os gráficos de utilização ajudam a identificar "
@@ -364,17 +382,12 @@ def setup_cloudwatch_dashboard(
         dashboard_errors = response.get("DashboardValidationMessages", [])
         if dashboard_errors:
             print(
-                "  └─ ⚠️ Dashboard criado com avisos de validação: "
-                f"{dashboard_errors}"
+                "  └─  Dashboard criado com avisos de validação: " f"{dashboard_errors}"
             )
         else:
             print(
-                f"  └─ ✅ CloudWatch Dashboard "
-                f"'{dashboard_name}' criado/atualizado."
+                f"  └─  CloudWatch Dashboard " f"'{dashboard_name}' criado/atualizado."
             )
-    except Exception as error:
-        print(
-            "  └─ ⚠️ Erro ao criar/atualizar CloudWatch Dashboard: "
-            f"{error}"
-        )
+    except ClientError as error:
+        print("  └─  Erro ao criar/atualizar CloudWatch Dashboard: " f"{error}")
         raise

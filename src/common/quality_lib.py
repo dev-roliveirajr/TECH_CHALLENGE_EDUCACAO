@@ -1,10 +1,8 @@
 """
 ===============================================================================
-BIBLIOTECA DE REGRAS DE QUALIDADE, CURADORIA E GOVERNANÇA (src/common/quality_lib.py)
+BIBLIOTECA DE VALIDAÇÃO DE DADOS (src/common/quality_lib.py)
 ===============================================================================
-Descrição: Módulo reutilizável para PySpark contendo travas bloqueantes de
-qualidade de dados (Taxa de Join, verificação de nulos, unicidade de chaves,
-deduplicação determinística por janela e validação cruzada para Gold).
+Funções para verificar junções, valores nulos, duplicidades e divergências.
 ===============================================================================
 """
 
@@ -23,7 +21,7 @@ def check_join_ratio(
     """Calcula e valida a Taxa de Correspondência (Match Ratio) de JOIN."""
     total_left = df_left.count()
     if total_left == 0:
-        print("⚠️ [QUALIDADE DE JOIN] Alerta: DataFrame de origem possui 0 registros.")
+        print(" [QUALIDADE DE JOIN] Alerta: DataFrame de origem possui 0 registros.")
         return 0.0, {"total_left": 0, "total_matched": 0, "match_ratio": 0.0}
 
     if match_key_col and match_key_col in df_joined.columns:
@@ -34,11 +32,11 @@ def check_join_ratio(
     match_ratio = (total_matched / float(total_left)) * 100.0
 
     print("=" * 70)
-    print("🔍 [GATE DE QUALIDADE - TAXA DE MATCH DO JOIN]")
+    print(" [VERIFICAÇÃO DA TAXA DE CORRESPONDÊNCIA DO JOIN]")
     print(f"   ├─ Registros na Origem (Fato/Esquerda): {total_left:,}")
-    print(f"   ├─ Registros Combinados com Sucesso   : {total_matched:,}")
+    print(f"   ├─ Registros correspondentes         : {total_matched:,}")
     print(f"   ├─ Taxa de Correspondência Medida     : {match_ratio:.2f}%")
-    print(f"   └─ Limiar Mínimo Requerido (Gate)     : {threshold_percent:.2f}%")
+    print(f"   └─ Limiar configurado                 : {threshold_percent:.2f}%")
     print("=" * 70)
 
     metrics = {
@@ -50,15 +48,16 @@ def check_join_ratio(
 
     if match_ratio < threshold_percent:
         msg = (
-            f"❌ [FALHA BLOQUEANTE DE QUALIDADE] Taxa de correspondência de JOIN ({match_ratio:.2f}%) "
-            f"ficou abaixo do limiar aceitável ({threshold_percent:.2f}%)."
+            f"Taxa de correspondência do JOIN ({match_ratio:.2f}%) "
+            f"abaixo do limiar definido ({threshold_percent:.2f}%)."
         )
         print(msg)
         if raise_on_failure:
             raise ValueError(msg)
     else:
         print(
-            f"✅ [GATE APROVADO] Taxa de JOIN dentro do padrão estipulado ({match_ratio:.2f}% >= {threshold_percent:.2f}%)."
+            f"Taxa de correspondência do JOIN: {match_ratio:.2f}% "
+            f"(limiar: {threshold_percent:.2f}%)."
         )
 
     return match_ratio, metrics
@@ -76,7 +75,7 @@ def check_null_threshold(
     if total_rows == 0:
         return null_metrics
 
-    print("🔍 [QUALIDADE - NULOS EM COLUNAS CHAVE]")
+    print(" [QUALIDADE - NULOS EM COLUNAS CHAVE]")
     failed_cols = []
 
     for col in columns:
@@ -86,7 +85,7 @@ def check_null_threshold(
         null_percent = (null_count / float(total_rows)) * 100.0
         null_metrics[col] = round(null_percent, 2)
 
-        status = "✅ OK" if null_percent <= max_null_percent else "❌ EXCEDIDO"
+        status = " OK" if null_percent <= max_null_percent else " EXCEDIDO"
         print(
             f"   ├─ Coluna '{col}': {null_percent:.2f}% nulos ({null_count:,} linhas) -> {status}"
         )
@@ -95,7 +94,7 @@ def check_null_threshold(
             failed_cols.append((col, null_percent))
 
     if failed_cols and raise_on_failure:
-        msg = f"❌ [FALHA BLOQUEANTE] Colunas excederam o limite máximo de NULOs ({max_null_percent}%): {failed_cols}."
+        msg = f"Colunas acima do limite de valores nulos ({max_null_percent}%): {failed_cols}."
         raise ValueError(msg)
 
     return null_metrics
@@ -113,12 +112,12 @@ def check_uniqueness(
     duplicate_rows = total_rows - distinct_keys
     duplicate_percent = (duplicate_rows / float(total_rows)) * 100.0
 
-    print("🔍 [QUALIDADE - UNICIDADE DE REGISTROS]")
+    print(" [QUALIDADE - UNICIDADE DE REGISTROS]")
     print(f"   ├─ Total de Linhas: {total_rows:,} | Chaves Únicas: {distinct_keys:,}")
     print(f"   └─ Linhas Duplicadas: {duplicate_rows:,} ({duplicate_percent:.2f}%)")
 
     if duplicate_rows > 0 and raise_on_failure:
-        msg = f"❌ [FALHA BLOQUEANTE] Encontradas {duplicate_rows:,} linhas duplicadas nas chaves: {key_columns}."
+        msg = f"Encontradas {duplicate_rows:,} linhas duplicadas nas chaves: {key_columns}."
         raise ValueError(msg)
 
     return duplicate_rows, round(duplicate_percent, 2)
@@ -175,7 +174,7 @@ def check_cross_validation(
     total_records = df_valid.count()
 
     if total_records == 0:
-        print("⚠️ [VALIDAÇÃO CRUZADA] Sem registros pareados para comparação.")
+        print(" [VALIDAÇÃO CRUZADA] Sem registros pareados para comparação.")
         return 0.0, {"total_records": 0, "avg_divergence": 0.0}
 
     # Diferença absoluta entre taxa calculada pelo aluno e taxa publicada pelo município
@@ -187,7 +186,7 @@ def check_cross_validation(
     avg_divergence = float(rows[0][0]) if rows and rows[0][0] is not None else 0.0
 
     print("=" * 70)
-    print("🔬 [VALIDAÇÃO CRUZADA - MICRODADOS vs. TAXA PUBLICADA]")
+    print(" [VALIDAÇÃO CRUZADA - MICRODADOS vs. TAXA PUBLICADA]")
     print(f"   ├─ Registros Comparados           : {total_records:,}")
     print(f"   ├─ Divergência Média Absoluta     : {avg_divergence:.3f}%")
     print(f"   └─ Tolerância Máxima Permitida    : {max_divergence_percent:.2f}%")
@@ -200,13 +199,11 @@ def check_cross_validation(
     }
 
     if avg_divergence > max_divergence_percent:
-        msg = f"⚠️ [ALERTA DE DIVERGÊNCIA] Divergência média ({avg_divergence:.3f}%) excedeu a tolerância ({max_divergence_percent}%)."
+        msg = f" [ALERTA DE DIVERGÊNCIA] Divergência média ({avg_divergence:.3f}%) excedeu a tolerância ({max_divergence_percent}%)."
         print(msg)
         if raise_on_failure:
             raise ValueError(msg)
     else:
-        print(
-            f"✅ [VALIDAÇÃO CRUZADA APROVADA] Alinhamento dentro da margem de tolerância ({avg_divergence:.3f}% <= {max_divergence_percent}%)."
-        )
+        print(f"Validação cruzada concluída. Divergência média: {avg_divergence:.3f}%.")
 
     return avg_divergence, metrics

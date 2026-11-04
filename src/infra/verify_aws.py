@@ -29,7 +29,7 @@ EXPECTED_S3_FILES = [
 
 
 def check_s3_artifacts():
-    print(f"📦 1. Verificando artefatos no S3 (s3://{S3_BUCKET}/)...")
+    print(f" 1. Verificando artefatos no S3 (s3://{S3_BUCKET}/)...")
     try:
         response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix="scripts/")
         existing_keys = {
@@ -39,15 +39,15 @@ def check_s3_artifacts():
         for key in EXPECTED_S3_FILES:
             if key in existing_keys:
                 size_bytes = existing_keys[key]
-                print(f"   ✅ Arquivo S3 encontrado: {key} ({size_bytes} bytes)")
+                print(f"    Arquivo S3 encontrado: {key} ({size_bytes} bytes)")
             else:
-                print(f"   ❌ Arquivo NÃO encontrado: {key}")
+                print(f"    Arquivo NÃO encontrado: {key}")
     except Exception as e:
-        print(f"   ❌ Erro ao listar bucket S3: {str(e)}")
+        print(f"    Erro ao listar bucket S3: {str(e)}")
 
 
 def check_glue_jobs():
-    print("\n⚙️ 2. Verificando configurações dos Glue Jobs no AWS Catalog...")
+    print("\n 2. Verificando configurações dos Glue Jobs no AWS Catalog...")
     for job_name in EXPECTED_JOBS:
         try:
             response = glue.get_job(JobName=job_name)
@@ -61,17 +61,17 @@ def check_glue_jobs():
             script_loc = job.get("Command", {}).get("ScriptLocation", "N/A")
             extra_py = job.get("DefaultArguments", {}).get("--extra-py-files", "N/A")
 
-            print(f"\n   🔹 Glue Job: {job_name}")
+            print(f"\n    Glue Job: {job_name}")
             print(f"      ├─ Script S3: {script_loc}")
             print(f"      ├─ Glue Version: {glue_ver}")
-            print(f"      ├─ Capacidade: {num_workers} x {worker_type} (FinOps OK)")
+            print(f"      ├─ Capacidade: {num_workers} x {worker_type}")
             print(f"      ├─ Re-tentativas (MaxRetries): {max_retries}")
             print(f"      ├─ Role IAM: {role}")
             print(f"      └─ Biblioteca Auxiliar: {extra_py}")
         except glue.exceptions.EntityNotFoundException:
-            print(f"   ❌ Job {job_name} NÃO foi encontrado no Glue Catalog.")
+            print(f"    Job {job_name} NÃO foi encontrado no Glue Catalog.")
         except Exception as e:
-            print(f"   ❌ Erro ao consultar Job {job_name}: {str(e)}")
+            print(f"    Erro ao consultar Job {job_name}: {str(e)}")
 
 
 def main():

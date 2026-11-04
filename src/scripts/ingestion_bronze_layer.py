@@ -2,14 +2,11 @@
 ===============================================================================
 JOB AWS GLUE - CAMADA BRONZE (src/scripts/ingestion_bronze_layer.py)
 ===============================================================================
-Descrição: Ingestão incremental, idempotente e concorrente das entidades oficiais
-da educação do GCP BigQuery para o Amazon S3 na Camada Bronze.
-DevSecOps & Performance:
-  - Autenticação 100% IN-MEMORY via AWS Secrets Manager.
-  - Resolução dinâmica do Bucket S3 e da Secret via env/argumentos.
-  - Particionamento dinâmico baseado em tamanho de bloco alvo (128 MB).
-  - Otimização com Adaptive Query Execution (AQE) do Spark 3.3+.
-  - Extração de contagem de linhas e tamanho via metadados BQ (Zero Scan).
+Descrição: Ingestão das tabelas do BigQuery para o Amazon S3 na Camada Bronze.
+Operações:
+  - Credenciais GCP via AWS Secrets Manager.
+  - Verificação de versão por metadados do BigQuery e estado registrado no S3.
+  - Particionamento de saída baseado em metadados de tamanho e configuração Spark.
 ===============================================================================
 """
 
@@ -18,9 +15,10 @@ import os
 import json
 import math
 import base64
-from datetime import datetime
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import boto3
+from botocore.exceptions import ClientError
 from awsglue.context import GlueContext
 from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
@@ -36,6 +34,7 @@ spark = glueContext.spark_session
 # Configuração de Otimização: Adaptive Query Execution (AQE)
 spark.conf.set("spark.sql.adaptive.enabled", "true")
 spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "true")
+spark.conf.set("spark.sql.sources.partitionOverwriteMode", "DYNAMIC")
 
 # Obter parâmetros de execução passados pelo Glue Job
 job_name = "01_bronze_ingestion"
@@ -57,7 +56,7 @@ if not job_run_id:
         args_run = getResolvedOptions(sys.argv, ["JOB_RUN_ID"])
         job_run_id = args_run["JOB_RUN_ID"]
     except Exception:
-        job_run_id = f"brz_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+        job_run_id = f"brz_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
 
 # Resolução dinâmica do Bucket S3
 S3_BUCKET = os.getenv("S3_BUCKET_NAME")
@@ -69,10 +68,11 @@ if not S3_BUCKET:
         pass
 
 if not S3_BUCKET:
-    raise ValueError("❌ A variável/argumento S3_BUCKET_NAME não foi definida!")
+    raise ValueError("A variável/argumento S3_BUCKET_NAME não foi definida.")
 
 BRONZE_BASE_PATH = f"s3://{S3_BUCKET}/bronze"
 AUDIT_BASE_PATH = "auditoria/bronze"
+SOURCE_STATE_PREFIX = f"{AUDIT_BASE_PATH}/source_versions"
 AWS_REGION = os.getenv("AWS_DEFAULT_REGION", os.getenv("AWS_REGION", "us-east-1"))
 SECRET_NAME = os.getenv(
     "GCP_BIGQUERY_KEY_SECRET_NAME", "pipeline-educacao/gcp/bigquery"
@@ -82,48 +82,85 @@ METADATA_COLUMNS = {"_ingested_at", "_source", "ref_ano", "ref_mes", "ref_dia"}
 
 
 def fetch_gcp_credentials_in_memory():
-    """Obtém as credenciais do GCP diretamente do AWS Secrets Manager"""
-    print(
-        f"🔐 [SecOps] Buscando Secret '{SECRET_NAME}' no AWS Secrets Manager (In-Memory)..."
-    )
+    """Obtém as credenciais do GCP do Secrets Manager ou de fallback local explícito."""
+    print(f" Consultando a Secret '{SECRET_NAME}' no AWS Secrets Manager.")
     sm_client = boto3.client("secretsmanager", region_name=AWS_REGION)
 
     try:
         sec_resp = sm_client.get_secret_value(SecretId=SECRET_NAME)
+    except ClientError as error:
+        error_code = error.response.get("Error", {}).get("Code")
+        if error_code != "ResourceNotFoundException":
+            raise RuntimeError(
+                f"Não foi possível obter a Secret '{SECRET_NAME}' do "
+                "AWS Secrets Manager."
+            ) from error
+        sec_resp = None
+
+    if sec_resp is not None:
         sec_string = sec_resp.get("SecretString")
-        if sec_string:
-            sec_json = json.loads(sec_string)
-            if "type" in sec_json and "private_key" in sec_json:
-                b64_creds = base64.b64encode(sec_string.encode("utf-8")).decode("utf-8")
-                print(
-                    f"  └─ ✅ Credenciais obtidas em memória RAM via Secrets Manager ('{SECRET_NAME}'). Zero disco utilizado."
-                )
-                return sec_json, b64_creds, sec_string
-    except Exception:
-        pass
+        if not sec_string:
+            raise ValueError(f"A Secret '{SECRET_NAME}' não contém um valor textual.")
+        sec_json = _parse_gcp_service_account(sec_string, f"Secret '{SECRET_NAME}'")
+        b64_creds = base64.b64encode(sec_string.encode("utf-8")).decode("utf-8")
+        print(f"  Credenciais obtidas do AWS Secrets Manager ('{SECRET_NAME}').")
+        return sec_json, b64_creds, sec_string
 
-    # Fallback para dev local se houver gcp-key.json no ambiente local
+    local_fallback_enabled = (
+        os.getenv("GCP_CREDENTIALS_LOCAL_FALLBACK", "").lower() == "true"
+        and "--JOB_NAME" not in sys.argv
+    )
+    if local_fallback_enabled:
+        local_credentials = _load_local_gcp_credentials()
+        if local_credentials:
+            return local_credentials
+
+    raise RuntimeError(
+        f"A Secret '{SECRET_NAME}' não foi encontrada no AWS Secrets Manager. "
+        "Para execução local, habilite GCP_CREDENTIALS_LOCAL_FALLBACK=true "
+        "e forneça gcp-key.json ou gcp_key.json."
+    )
+
+
+def _parse_gcp_service_account(content, source_name):
+    try:
+        credentials = json.loads(content)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"{source_name} não contém JSON válido.") from error
+    if (
+        not isinstance(credentials, dict)
+        or credentials.get("type") != "service_account"
+        or not credentials.get("private_key")
+        or not credentials.get("client_email")
+    ):
+        raise ValueError(
+            f"{source_name} não contém uma credencial de service account válida."
+        )
+    return credentials
+
+
+def _load_local_gcp_credentials():
     for local_key in ["gcp-key.json", "gcp_key.json"]:
-        if os.path.exists(local_key):
-            print(
-                f"  └─ ℹ️ [Dev Local] Carregando chave local para memória: {local_key}"
-            )
-            with open(local_key, "r", encoding="utf-8") as f:
-                content = f.read()
-                sec_json = json.loads(content)
-                b64_creds = base64.b64encode(content.encode("utf-8")).decode("utf-8")
-                return sec_json, b64_creds, content
+        if not os.path.exists(local_key):
+            continue
+        with open(local_key, "r", encoding="utf-8") as credential_file:
+            content = credential_file.read()
+        credentials = _parse_gcp_service_account(
+            content, f"Credencial local '{local_key}'"
+        )
+        encoded_credentials = base64.b64encode(content.encode("utf-8")).decode("utf-8")
+        print(f"  Credenciais locais carregadas: '{local_key}'.")
+        return credentials, encoded_credentials, content
+    return None
 
-    return None, None, None
 
-
-# Carregamento 100% In-Memory das Credenciais
+# Carregamento em memória das Credenciais
 gcp_secret_dict, gcp_b64_credentials, gcp_raw_string = fetch_gcp_credentials_in_memory()
 gcp_project_id = None
 bq_client = None
 
 if gcp_secret_dict:
-    print("🔑 Autenticação GCP ativada 100% In-Memory (RAM).")
+    print(" Credenciais GCP carregadas.")
     credentials = service_account.Credentials.from_service_account_info(gcp_secret_dict)
     gcp_project_id = credentials.project_id
     bq_client = bigquery.Client(credentials=credentials, project=gcp_project_id)
@@ -132,8 +169,7 @@ if gcp_secret_dict:
     spark.conf.set("parentProject", gcp_project_id)
     spark.conf.set("credentials", gcp_b64_credentials)
 else:
-    print("⚠️ Nenhuma Secret encontrada. Inicializando cliente BigQuery padrão...")
-    bq_client = bigquery.Client()
+    raise RuntimeError("Credenciais GCP não foram carregadas.")
 
 s3_client = boto3.client("s3", region_name=AWS_REGION)
 
@@ -160,15 +196,157 @@ def load_bigquery_table(table_id):
             reader = reader.option("credentials", gcp_b64_credentials)
         return reader.load()
     except Exception as e:
-        print(f"   ⚠️ Spark BigQuery Connector falhou para {table_id}: {e}")
+        print(f"    Spark BigQuery Connector falhou para {table_id}: {e}")
         raise
 
 
+def _format_source_modified(modified):
+    if not isinstance(modified, datetime):
+        raise ValueError("O BigQuery não retornou um horário de modificação válido.")
+    if modified.tzinfo is None:
+        modified = modified.replace(tzinfo=timezone.utc)
+    return modified.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _parse_source_modified(value):
+    if not isinstance(value, str):
+        raise ValueError("O marcador de ingestão não contém source_modified válido.")
+    try:
+        modified = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError(
+            "O marcador de ingestão contém source_modified inválido."
+        ) from error
+    if modified.tzinfo is None:
+        modified = modified.replace(tzinfo=timezone.utc)
+    return modified.astimezone(timezone.utc)
+
+
+def _read_entity_state(entity):
+    state_key = f"{SOURCE_STATE_PREFIX}/{entity}.json"
+    try:
+        response = s3_client.get_object(Bucket=S3_BUCKET, Key=state_key)
+    except ClientError as error:
+        error_code = str(error.response.get("Error", {}).get("Code", ""))
+        if error_code in {"404", "NoSuchKey", "NotFound"}:
+            return None
+        raise RuntimeError(
+            f"Não foi possível consultar o estado Bronze da entidade '{entity}'."
+        ) from error
+
+    try:
+        state = json.loads(response["Body"].read().decode("utf-8"))
+    except (
+        KeyError,
+        AttributeError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as error:
+        raise ValueError(
+            f"O marcador de ingestão da entidade '{entity}' é inválido."
+        ) from error
+
+    if (
+        not isinstance(state, dict)
+        or state.get("entity") != entity
+        or state.get("status") != "SUCCEEDED"
+    ):
+        raise ValueError(
+            f"O marcador de ingestão da entidade '{entity}' não representa "
+            "uma gravação concluída."
+        )
+    if not isinstance(state.get("bq_rows"), int) or isinstance(
+        state.get("bq_rows"), bool
+    ):
+        raise ValueError(
+            f"O marcador de ingestão da entidade '{entity}' não contém "
+            "uma contagem de linhas válida."
+        )
+    if not isinstance(state.get("source_num_bytes"), int) or isinstance(
+        state.get("source_num_bytes"), bool
+    ):
+        raise ValueError(
+            f"O marcador de ingestão da entidade '{entity}' não contém "
+            "um tamanho de origem válido."
+        )
+    state["source_modified_at"] = _parse_source_modified(state.get("source_modified"))
+    expected_prefix = f"s3://{S3_BUCKET}/bronze/{entity}/"
+    if not isinstance(state.get("s3_prefix"), str) or not state["s3_prefix"].startswith(
+        expected_prefix
+    ):
+        raise ValueError(
+            f"O marcador de ingestão da entidade '{entity}' contém um prefixo inválido."
+        )
+    return state
+
+
+def _entity_state_has_data(entity, state):
+    s3_prefix = state.get("s3_prefix")
+    expected_prefix = f"s3://{S3_BUCKET}/bronze/{entity}/"
+    if not isinstance(s3_prefix, str) or not s3_prefix.startswith(expected_prefix):
+        raise ValueError(
+            f"O marcador de ingestão da entidade '{entity}' contém um prefixo inválido."
+        )
+    if state["bq_rows"] == 0:
+        return True
+
+    request = {
+        "Bucket": S3_BUCKET,
+        "Prefix": s3_prefix.removeprefix(f"s3://{S3_BUCKET}/"),
+        "MaxKeys": 1000,
+    }
+    while True:
+        try:
+            response = s3_client.list_objects_v2(**request)
+        except ClientError as error:
+            raise RuntimeError(
+                f"Não foi possível verificar os dados Bronze da entidade '{entity}'."
+            ) from error
+
+        if any(
+            item.get("Key", "").endswith(".parquet")
+            for item in response.get("Contents", [])
+        ):
+            return True
+        if not response.get("IsTruncated"):
+            return False
+        continuation_token = response.get("NextContinuationToken")
+        if not continuation_token:
+            raise RuntimeError(
+                f"A listagem dos dados Bronze da entidade '{entity}' "
+                "foi truncada sem token de continuação."
+            )
+        request["ContinuationToken"] = continuation_token
+
+
+def _write_entity_state(entity, state):
+    state_key = f"{SOURCE_STATE_PREFIX}/{entity}.json"
+    try:
+        s3_client.put_object(
+            Bucket=S3_BUCKET,
+            Key=state_key,
+            Body=json.dumps(state, indent=2, ensure_ascii=False).encode("utf-8"),
+            ContentType="application/json",
+        )
+    except ClientError as error:
+        raise RuntimeError(
+            f"Não foi possível registrar a versão ingerida da entidade '{entity}'."
+        ) from error
+
+
+def _source_version_matches(state, modified_at, num_rows, num_bytes):
+    return (
+        state["source_modified_at"] == modified_at
+        and state["bq_rows"] == num_rows
+        and state["source_num_bytes"] == num_bytes
+    )
+
+
 def process_entity(entity):
-    """Processa a ingestão de uma entidade individual de forma isolada, resiliente e dinamicamente particionada."""
+    """Processa a ingestão de uma entidade com particionamento por data."""
     table_id = f"{DATASET_BQ}.{entity}"
     print(
-        f"\n🔍 [Entidade {entity.upper()}] Checando metadados no BigQuery: '{table_id}'..."
+        f"\n [Entidade {entity.upper()}] Checando metadados no BigQuery: '{table_id}'..."
     )
 
     try:
@@ -176,38 +354,38 @@ def process_entity(entity):
         table_meta = bq_client.get_table(table_id)
         mod_time = table_meta.modified
         num_rows = getattr(table_meta, "num_rows", -1)
+        if not isinstance(num_rows, int) or isinstance(num_rows, bool):
+            num_rows = -1
         num_bytes = getattr(table_meta, "num_bytes", 0) or 0
         size_mb = num_bytes / (1024.0 * 1024.0)
+        source_modified = _format_source_modified(mod_time)
+        source_modified_at = _parse_source_modified(source_modified)
 
         ref_ano = f"{mod_time.year}"
         ref_mes = f"{mod_time.month:02d}"
         ref_dia = f"{mod_time.day:02d}"
 
-        s3_partition_prefix = (
-            f"bronze/{entity}/ref_ano={ref_ano}/ref_mes={ref_mes}/ref_dia={ref_dia}/"
-        )
-
-        s3_response = s3_client.list_objects_v2(
-            Bucket=S3_BUCKET, Prefix=s3_partition_prefix, MaxKeys=1
-        )
-
-        if "Contents" in s3_response and len(s3_response["Contents"]) > 0:
-            print(
-                f"   ℹ️ [{entity.upper()}] Dados já atualizados para {ref_ano}-{ref_mes}-{ref_dia}. Ingestão SKIPPED."
+        previous_state = _read_entity_state(entity)
+        if (
+            previous_state
+            and _source_version_matches(
+                previous_state, source_modified_at, num_rows, num_bytes
             )
+            and _entity_state_has_data(entity, previous_state)
+        ):
+            print(f"    [{entity.upper()}] A versão atual já está registrada no S3.")
             return {
                 "entity": entity,
-                "bq_rows": num_rows,
-                "s3_rows": 0,
-                "size_mb": 0,
+                "bq_rows": previous_state["bq_rows"],
+                "s3_rows": None,
+                "size_mb": previous_state.get("size_mb"),
                 "status": "SKIPPED (Already Up-to-Date)",
                 "partitions": 0,
-                "s3_prefix": f"s3://{S3_BUCKET}/{s3_partition_prefix}",
+                "source_modified": previous_state.get("source_modified"),
+                "s3_prefix": previous_state["s3_prefix"],
             }
 
-        print(
-            f"   📦 [{entity.upper()}] Nova versão detectada ({ref_ano}-{ref_mes}-{ref_dia}). Lendo BigQuery..."
-        )
+        print(f"    [{entity.upper()}] Nova versão detectada. Lendo BigQuery...")
         df = load_bigquery_table(table_id)
 
         # Validação contra colisão de colunas de metadados
@@ -217,7 +395,7 @@ def process_entity(entity):
                 f"Colunas de origem conflitam com metadados de auditoria: {sorted(collisions)}"
             )
 
-        now_utc = datetime.utcnow().isoformat()
+        now_utc = datetime.now(timezone.utc).isoformat()
         df_bronze = (
             df.withColumn("_ingested_at", F.lit(now_utc))
             .withColumn("_source", F.lit("basedosdados_bigquery"))
@@ -227,7 +405,7 @@ def process_entity(entity):
         )
 
         output_path = f"{BRONZE_BASE_PATH}/{entity}/"
-        print(f"   └─ 💾 [{entity.upper()}] Gravando no S3 em: {output_path}")
+        print(f"   └─  [{entity.upper()}] Gravando no S3 em: {output_path}")
 
         # Otimização Dinâmica: Cálculo de partições baseado no bloco alvo (128 MB)
         target_partitions = max(1, math.ceil(size_mb / TARGET_FILE_SIZE_MB))
@@ -236,34 +414,49 @@ def process_entity(entity):
         if target_partitions < current_partitions:
             df_writer = df_bronze.coalesce(target_partitions)
             print(
-                f"   └─ ⚡ [{entity.upper()}] Coalesce dinâmico aplicado: {current_partitions} ➔ {target_partitions} partição(ões) ({size_mb:.2f} MB / {TARGET_FILE_SIZE_MB} MB alvo)."
+                f"   └─  [{entity.upper()}] Coalesce dinâmico aplicado: {current_partitions} ➔ {target_partitions} partição(ões) ({size_mb:.2f} MB / {TARGET_FILE_SIZE_MB} MB alvo)."
             )
         else:
             df_writer = df_bronze
             print(
-                f"   └─ ⚡ [{entity.upper()}] Mantido particionamento Spark: {current_partitions} partição(ões) ({size_mb:.2f} MB)."
+                f"   └─  [{entity.upper()}] Mantido particionamento Spark: {current_partitions} partição(ões) ({size_mb:.2f} MB)."
             )
 
-        df_writer.write.mode("append").partitionBy(
+        df_writer.write.mode("overwrite").partitionBy(
             "ref_ano", "ref_mes", "ref_dia"
         ).parquet(output_path)
 
-        rows_str = f"{num_rows:,} linhas" if num_rows >= 0 else "sucesso"
-        print(
-            f"   └─ ✅ [{entity.upper()}] Gravada na Camada Bronze com sucesso ({rows_str})!"
-        )
+        state = {
+            "entity": entity,
+            "table_id": table_id,
+            "source_modified": source_modified,
+            "bq_rows": num_rows,
+            "source_num_bytes": num_bytes,
+            "size_mb": round(size_mb, 2),
+            "status": "SUCCEEDED",
+            "s3_prefix": (
+                f"s3://{S3_BUCKET}/bronze/{entity}/"
+                f"ref_ano={ref_ano}/ref_mes={ref_mes}/ref_dia={ref_dia}/"
+            ),
+            "ingested_at_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        _write_entity_state(entity, state)
+
+        rows_str = f"{num_rows:,} linhas no BigQuery" if num_rows >= 0 else "concluída"
+        print(f"   [{entity.upper()}] Gravação Bronze concluída ({rows_str}).")
         return {
             "entity": entity,
             "bq_rows": num_rows,
-            "s3_rows": num_rows,
+            "s3_rows": None,
             "size_mb": round(size_mb, 2),
             "status": "SUCCEEDED",
-            "partitions": target_partitions,
-            "s3_prefix": f"s3://{S3_BUCKET}/{s3_partition_prefix}",
+            "partitions": df_writer.rdd.getNumPartitions(),
+            "source_modified": source_modified,
+            "s3_prefix": state["s3_prefix"],
         }
 
     except Exception as e:
-        print(f"   └─ ❌ [{entity.upper()}] Falha no processamento: {str(e)}")
+        print(f"   └─  [{entity.upper()}] Falha no processamento: {str(e)}")
         raise RuntimeError(
             f"Pipeline Bronze interrompido na entidade '{entity}': {str(e)}"
         ) from e
@@ -271,13 +464,11 @@ def process_entity(entity):
 
 def main():
     print("=" * 75)
-    print(
-        "🚀 INICIANDO INGESTÃO BRONZE (AUTENTICAÇÃO IN-MEMORY & PARTICIONAMENTO DINÂMICO 128MB)"
-    )
+    print(" Iniciando ingestão da Camada Bronze.")
     print(f"   Bucket de Destino: {BRONZE_BASE_PATH}")
     print("=" * 75)
 
-    started_at_utc = datetime.utcnow()
+    started_at_utc = datetime.now(timezone.utc)
     ingestion_date = started_at_utc.strftime("%Y-%m-%d")
     summary_report = []
 
@@ -292,34 +483,32 @@ def main():
                 res = future.result()
                 summary_report.append(res)
             except Exception as exc:
-                print(f"❌ Erro na execução da entidade {entity}: {exc}")
+                print(f" Erro na execução da entidade {entity}: {exc}")
                 raise exc
 
     # Ordena o resumo de acordo com a ordem oficial das ENTITIES
     summary_report.sort(key=lambda x: ENTITIES.index(x["entity"]))
     print("\n" + "=" * 75)
-    print("RESUMO DA INGESTÃO BRONZE (AUTENTICAÇÃO IN-MEMORY):")
+    print("Resumo da ingestão Bronze:")
     for item in summary_report:
         ent = item["entity"]
         status = item["status"]
         count = item["bq_rows"]
         rows_str = (
-            f"({count:,} linhas ingeridas)"
+            f"({count:,} linhas nos metadados da origem)"
             if status == "SUCCEEDED"
-            else "(Already Up-to-Date)"
+            else "(sem gravação nesta execução)"
         )
         print(f" - {ent.ljust(30)}: {status} {rows_str}")
     print("=" * 75)
-    print("✅ Camada Bronze concluída com sucesso!")
-
-    # 📜 Gravação do Manifesto de Auditoria no S3
+    #  Gravação do Manifesto de Auditoria no S3
     manifest_key = f"{AUDIT_BASE_PATH}/ingestion_date={ingestion_date}/run_id={job_run_id}/manifest.json"
     manifest_payload = {
         "job_name": job_name,
         "run_id": job_run_id,
         "ingestion_date": ingestion_date,
         "started_at_utc": started_at_utc.strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "finished_at_utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "finished_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "status": "SUCCEEDED",
         "is_full_batch": True,
         "total_entities": len(ENTITIES),
@@ -336,10 +525,15 @@ def main():
             ),
             ContentType="application/json",
         )
-        print("\n📜 [Auditoria & Governança] Manifesto salvo no S3 com sucesso:")
-        print(f"   └─ s3://{S3_BUCKET}/{manifest_key}")
-    except Exception as manifest_err:
-        print(f"⚠️ Alerta: Falha ao salvar manifesto no S3: {str(manifest_err)}")
+    except ClientError as manifest_err:
+        raise RuntimeError(
+            f"Não foi possível salvar o manifesto Bronze em "
+            f"s3://{S3_BUCKET}/{manifest_key}."
+        ) from manifest_err
+
+    print("\n Manifesto Bronze salvo no S3:")
+    print(f"   s3://{S3_BUCKET}/{manifest_key}")
+    print("Camada Bronze concluída.")
 
 
 if __name__ == "__main__":

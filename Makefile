@@ -34,8 +34,10 @@ aws:
 	python src/infra/deploy_aws_setup.py
 
 events:
-	python src/generators/generate_alunos_events.py -n $$(python -c "import random; print(random.randint(1, 50))")
-#	python src/generators/generate_metas_events.py -d municipio -n $$(python -c "import random; print(random.randint(1, 20))")
+	python src/generators/generate_alunos_events.py --quantity $$(python -c "import random; print(random.randint(1, 100))")
+	python src/generators/generate_metas_events.py --domain municipio --quantity $$(python -c "import random; print(random.randint(1, 10))")
+	python src/generators/generate_metas_events.py --domain uf --quantity $$(python -c "import random; print(random.randint(1, 2))")
+	python src/generators/generate_metas_events.py --domain brasil --quantity 1
 
 clean:
 	find . -type f -name "*.pyc" -delete
