@@ -2,7 +2,7 @@
 
 Pipeline de dados em arquitetura medalhão para ingerir dados públicos do Saeb/Inep, curá-los e publicar indicadores e Feature Stores analíticas. A ingestão e o processamento distribuído são executados no AWS Glue; os dados são armazenados no Amazon S3 em Parquet e Delta Lake.
 
-> **Vídeo executivo (até 5 minutos):** **Pendente** — [inserir aqui o link do vídeo no YouTube](https://www.youtube.com/).
+## Vídeo explicativo - https://youtu.be/xt8si9XHE9M
 
 ## Sumário
 
