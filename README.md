@@ -1,4 +1,4 @@
-# Pipeline de Dados de Alfabetização — Tech Challenge Fase 2
+# Pipeline de Dados de Alfabetização
 
 Pipeline de dados em arquitetura medalhão para ingerir dados públicos do Saeb/Inep, curá-los e publicar indicadores e Feature Stores analíticas. A ingestão e o processamento distribuído são executados no AWS Glue; os dados são armazenados no Amazon S3 em Parquet e Delta Lake.
 
