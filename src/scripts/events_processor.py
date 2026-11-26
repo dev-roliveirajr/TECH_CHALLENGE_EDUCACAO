@@ -13,6 +13,7 @@ idempotente via Delta Lake (MERGE INTO) com verificação prévia de dados.
 import sys
 import os
 import json
+import re
 import datetime
 
 try:
@@ -118,8 +119,9 @@ if not run_id:
             break
 if not run_id:
     run_id = (
-        f"evt_{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+        f"evt_{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}"
     )
+safe_run_id = re.sub(r"[^A-Za-z0-9_-]", "_", run_id)
 
 ingestion_date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
 
@@ -145,6 +147,30 @@ else:
     SILVER_PATH = f"s3://{S3_BUCKET}/silver/"
     AUDIT_PATH = f"s3://{S3_BUCKET}/auditoria/events/"
     CHECKPOINT_BASE = f"s3://{S3_BUCKET}/checkpoints/events/"
+
+try:
+    quarantine_options = (
+        getResolvedOptions(sys.argv, ["QUARANTINE_RETENTION_DAYS"])
+        if HAS_GLUE
+        else {}
+    )
+except Exception:
+    quarantine_options = {}
+try:
+    QUARANTINE_RETENTION_DAYS = int(
+        quarantine_options.get(
+            "QUARANTINE_RETENTION_DAYS",
+            os.getenv("QUARANTINE_RETENTION_DAYS", "10"),
+        )
+    )
+except ValueError as error:
+    raise ValueError("QUARANTINE_RETENTION_DAYS deve ser um inteiro positivo.") from error
+if QUARANTINE_RETENTION_DAYS < 1:
+    raise ValueError("QUARANTINE_RETENTION_DAYS deve ser um inteiro positivo.")
+
+EVENTS_SILVER_BASE = f"{SILVER_PATH}events/runs/{safe_run_id}/"
+QUARANTINE_BASE = f"{SILVER_PATH}quarantine/events/"
+QUARANTINE_CONTRACT_VERSION = "events-v2"
 
 print("=" * 75)
 print(" INICIANDO PROCESSADOR DE EVENTOS STREAMING (EVENTS PROCESSOR)")
@@ -277,7 +303,82 @@ checkpoint_alunos = (
 processed_alunos_count = 0
 processed_metas_count = 0
 processed_metas_by_domain = {"municipio": 0, "uf": 0, "brasil": 0}
+quarantined_counts = {"alunos": 0, "municipio": 0, "uf": 0, "brasil": 0}
 latency_stats = {"avg_sec": 0.0, "min_sec": 0.0, "max_sec": 0.0}
+
+
+def _read_events_stream(path, schema):
+    reader = spark.readStream.format("text")
+    if not LOCAL_MODE:
+        reader = reader.option("recursiveFileLookup", "true")
+    raw_events = reader.load(path)
+    parsed_events = raw_events.withColumn(
+        "_parsed_event",
+        F.from_json(F.col("value"), schema),
+    ).withColumn("_json_invalid", F.col("_parsed_event").isNull())
+    return parsed_events.select(
+        F.col("_parsed_event.*"),
+        F.col("value").alias("_raw_payload"),
+        F.col("_json_invalid"),
+    )
+
+
+def _quarantine_invalid_events(
+    dataframe,
+    invalid_condition,
+    validation_rules,
+    domain,
+    batch_id,
+):
+    total_rows = dataframe.count()
+    if total_rows == 0:
+        return dataframe.drop("_raw_payload", "_json_invalid"), 0
+
+    invalid_events = dataframe.filter(invalid_condition)
+    invalid_count = invalid_events.count()
+    if not invalid_count:
+        return dataframe.drop("_raw_payload"), 0
+    if "_raw_payload" not in dataframe.columns:
+        raise ValueError("O fluxo de eventos não preservou o payload original.")
+
+    reason = F.concat_ws(
+        "; ",
+        *[
+            F.when(condition, F.lit(field_name))
+            for field_name, condition in validation_rules
+        ],
+    )
+    quarantine = invalid_events.select(
+        F.col("_raw_payload").alias("raw_payload"),
+        F.col("event_id")
+        if "event_id" in dataframe.columns
+        else F.lit(None).alias("event_id"),
+        F.col("_source")
+        if "_source" in dataframe.columns
+        else F.lit(None).alias("_source"),
+        F.lit(domain).alias("domain"),
+        reason.alias("quarantine_reason"),
+        F.lit(safe_run_id).alias("run_id"),
+        F.lit(int(batch_id)).alias("source_batch_id"),
+        F.lit(QUARANTINE_CONTRACT_VERSION).alias("contract_version"),
+        F.current_timestamp().alias("quarantined_at"),
+    )
+    quarantine_path = (
+        f"{QUARANTINE_BASE}run_id={safe_run_id}/"
+        f"domain={domain}/batch_id={batch_id}/"
+    )
+    quarantine.write.mode("overwrite").parquet(quarantine_path)
+    quarantined_counts[domain] += invalid_count
+    print(
+        f"  └─  Quarentena ({domain}, micro-lote {batch_id}): "
+        f"{invalid_count:,} eventos em {quarantine_path}"
+    )
+
+    valid_events = dataframe.filter(~invalid_condition).drop(
+        "_raw_payload",
+        "_json_invalid",
+    )
+    return valid_events, invalid_count
 
 
 def process_alunos_batch(df_batch, batch_id):
@@ -290,48 +391,53 @@ def process_alunos_batch(df_batch, batch_id):
 
     print("\n  └─  Verificando a integridade do contrato json\n")
 
-    try:
-        invalid_condition = (
-            F.col("event_id").isNull()
-            | (F.trim(F.col("event_id")) == "")
-            | F.col("event_time").isNull()
+    validation_rules = [
+        ("event_id", F.col("event_id").isNull() | (F.trim(F.col("event_id")) == "")),
+        (
+            "event_time",
+            F.col("event_time").isNull()
             | (F.trim(F.col("event_time")) == "")
-            | F.to_timestamp(F.col("event_time")).isNull()
-            | F.col("id_aluno").isNull()
-            | (F.trim(F.col("id_aluno")) == "")
-            | F.col("id_municipio").isNull()
-            | (F.trim(F.col("id_municipio")) == "")
-            | F.col("id_escola").isNull()
-            | (F.trim(F.col("id_escola")) == "")
-            | F.col("ano").isNull()
-            | F.col("serie").isNull()
-            | (F.trim(F.col("serie")) == "")
-            | F.col("rede").isNull()
-            | (~F.col("rede").isin("0", "1", "2", "3", "4", "5", "6"))
-            | F.col("alfabetizado").isNull()
-            | (~F.col("alfabetizado").isin("0", "1"))
-            | F.col("proficiencia").isNull()
-            | F.col("peso_aluno").isNull()
-        )
-
-        invalid_records = df_batch.filter(invalid_condition).limit(1).count()
-
-        if invalid_records > 0:
-            raise ValueError(
-                "Registro inválido: existem campos obrigatórios "
-                "ausentes ou vazios no evento."
-            )
-
-        print("  └─  Estrutura contém os campos obrigatórios.\n")
-
-    except Exception as e:
-        raise ValueError(f" Falha na validação do contrato JSON: {e}") from e
-
-    # -------------------------------------------------------------------------
-
+            | F.to_timestamp(F.col("event_time")).isNull(),
+        ),
+        ("id_aluno", F.col("id_aluno").isNull() | (F.trim(F.col("id_aluno")) == "")),
+        (
+            "id_municipio",
+            F.col("id_municipio").isNull()
+            | (F.trim(F.col("id_municipio")) == ""),
+        ),
+        (
+            "id_escola",
+            F.col("id_escola").isNull() | (F.trim(F.col("id_escola")) == ""),
+        ),
+        ("ano", F.col("ano").isNull()),
+        ("serie", F.col("serie").isNull() | (F.trim(F.col("serie")) == "")),
+        ("rede", F.col("rede").isNull() | (~F.col("rede").isin("0", "1", "2", "3", "4", "5", "6"))),
+        (
+            "alfabetizado",
+            F.col("alfabetizado").isNull()
+            | (~F.col("alfabetizado").isin("0", "1")),
+        ),
+        ("proficiencia", F.col("proficiencia").isNull() | F.isnan("proficiencia")),
+        ("peso_aluno", F.col("peso_aluno").isNull() | (F.col("peso_aluno") <= 0)),
+        (
+            "_source",
+            F.col("_source").isNull()
+            | (F.col("_source") != F.lit("streaming_live_simulation")),
+        ),
+        ("json", F.col("_json_invalid")),
+    ]
+    invalid_condition = F.lit(False)
+    for _, condition in validation_rules:
+        invalid_condition = invalid_condition | condition
+    df_batch, quarantined = _quarantine_invalid_events(
+        df_batch, invalid_condition, validation_rules, "alunos", batch_id
+    )
     batch_count = df_batch.count()
     if batch_count == 0:
-        print(f"  └─  Micro-lote {batch_id} vazio; nenhum registro para processar.")
+        print(
+            f"  └─  Micro-lote {batch_id} sem eventos válidos "
+            f"({quarantined:,} em quarentena)."
+        )
         return
 
     print(
@@ -467,44 +573,13 @@ def process_alunos_batch(df_batch, batch_id):
     )
 
     # Operação de MERGE INTO (Upsert) no Delta Lake Silver
-    silver_target_path = f"{SILVER_PATH}alunos_curado/"
-    print(f" Executando MERGE INTO no Delta Lake Silver: {silver_target_path}")
-
-    if HAS_GLUE:
-        is_delta = DeltaTable.isDeltaTable(spark, silver_target_path)
-
-        if is_delta:
-            delta_target = DeltaTable.forPath(spark, silver_target_path)
-            target_cols = set(delta_target.toDF().schema.names)
-            update_cols = [
-                c
-                for c in df_batch.columns
-                if c in target_cols
-                and c not in ["_ingested_at_ts", "_event_time_ts", "latencia_segundos"]
-            ]
-
-            update_set = {c: f"source.{c}" for c in update_cols}
-            insert_values = {c: f"source.{c}" for c in update_cols}
-
-            delta_target.alias("target").merge(
-                source=df_batch.alias("source"),
-                condition="target.id_aluno = source.id_aluno AND target.ano = source.ano",
-            ).whenMatchedUpdate(set=update_set).whenNotMatchedInsert(
-                values=insert_values
-            ).execute()
-
-            print("  MERGE INTO de alunos executado no Delta Lake.")
-        else:
-            df_batch.drop(
-                "_ingested_at_ts", "_event_time_ts", "latencia_segundos"
-            ).write.format("delta").mode("append").save(silver_target_path)
-            print("  Tabela Delta Silver criada ou atualizada por append de eventos.")
-    else:
-        # Modo Fallback Local
-        df_batch.drop(
-            "_ingested_at_ts", "_event_time_ts", "latencia_segundos"
-        ).write.mode("append").parquet(silver_target_path)
-        print("  Eventos gravados na Silver em modo fallback.")
+    event_output_path = (
+        f"{EVENTS_SILVER_BASE}alunos/batch_id={batch_id}/"
+    )
+    df_batch.drop(
+        "_ingested_at_ts", "_event_time_ts", "latencia_segundos"
+    ).write.mode("overwrite").parquet(event_output_path)
+    print(f" Eventos sintéticos gravados em destino isolado: {event_output_path}")
 
     processed_alunos_count += batch_count
 
@@ -526,32 +601,61 @@ def process_metas_batch(df_batch, batch_id, domain):
         territory_key = "pais"
         expected_rede = "Pública"
 
-    invalid_condition = (
-        F.col("event_id").isNull()
-        | (F.trim(F.col("event_id")) == "")
-        | F.col("event_type").isNull()
-        | (F.col("event_type") != "META_UPDATE")
-        | F.col("domain").isNull()
-        | (F.col("domain") != domain)
-        | F.col("event_time").isNull()
-        | (F.trim(F.col("event_time")) == "")
-        | F.to_timestamp(F.col("event_time")).isNull()
-        | F.col("ano").isNull()
-        | F.col("rede").isNull()
-        | (F.col("rede") != expected_rede)
-        | F.col("meta_alfabetizacao_2030").isNull()
-        | (F.col("meta_alfabetizacao_2030") != 80.0)
-        | F.col(territory_key).isNull()
-        | (F.trim(F.col(territory_key)) == "")
-    )
-    if df_batch.filter(invalid_condition).limit(1).count() > 0:
-        raise ValueError(
-            f"Evento de meta inválido para o domínio '{domain}': "
-            "verifique event_id, domínio, rede, território e meta oficial de 2030."
+    validation_rules = [
+        ("event_id", F.col("event_id").isNull() | (F.trim(F.col("event_id")) == "")),
+        (
+            "event_type",
+            F.col("event_type").isNull()
+            | (F.col("event_type") != F.lit("META_UPDATE")),
+        ),
+        ("domain", F.col("domain").isNull() | (F.col("domain") != F.lit(domain))),
+        (
+            "event_time",
+            F.col("event_time").isNull()
+            | (F.trim(F.col("event_time")) == "")
+            | F.to_timestamp(F.col("event_time")).isNull(),
+        ),
+        ("ano", F.col("ano").isNull()),
+        ("rede", F.col("rede").isNull() | (F.col("rede") != F.lit(expected_rede))),
+        (
+            "meta_alfabetizacao_2030",
+            F.col("meta_alfabetizacao_2030").isNull()
+            | (F.col("meta_alfabetizacao_2030") < 0)
+            | (F.col("meta_alfabetizacao_2030") > 100),
+        ),
+        (
+            territory_key,
+            F.col(territory_key).isNull()
+            | (F.trim(F.col(territory_key)) == ""),
+        ),
+        (
+            "_source",
+            F.col("_source").isNull()
+            | (F.col("_source") != F.lit("streaming_live_simulation")),
+        ),
+        ("json", F.col("_json_invalid")),
+    ]
+    for year in range(2024, 2031):
+        column = f"meta_alfabetizacao_{year}"
+        validation_rules.append(
+            (
+                column,
+                F.col(column).isNotNull()
+                & ((F.col(column) < 0) | (F.col(column) > 100)),
+            )
         )
-
+    invalid_condition = F.lit(False)
+    for _, condition in validation_rules:
+        invalid_condition = invalid_condition | condition
+    df_batch, quarantined = _quarantine_invalid_events(
+        df_batch, invalid_condition, validation_rules, domain, batch_id
+    )
     batch_count = df_batch.count()
     if batch_count == 0:
+        print(
+            f"  └─  Micro-lote de metas {domain}/{batch_id} sem eventos válidos "
+            f"({quarantined:,} em quarentena)."
+        )
         return
 
     print(
@@ -574,44 +678,11 @@ def process_metas_batch(df_batch, batch_id, domain):
         .withColumn("_processed_silver_at", F.current_timestamp())
     )
 
-    meta_target_path = f"{SILVER_PATH}meta_alfabetizacao_{domain}/"
-    print(f"  └─  Persistindo eventos de metas na Camada Silver: {meta_target_path}")
-
-    if HAS_GLUE:
-        is_delta = DeltaTable.isDeltaTable(spark, meta_target_path)
-        if is_delta:
-            delta_target = DeltaTable.forPath(spark, meta_target_path)
-            target_cols = set(delta_target.toDF().schema.names)
-            missing_keys = set(business_keys) - target_cols
-            if missing_keys:
-                raise ValueError(
-                    f"A tabela Delta {meta_target_path} não contém as chaves "
-                    f"de negócio esperadas: {sorted(missing_keys)}."
-                )
-            merge_cols = [
-                column for column in df_batch.columns if column in target_cols
-            ]
-            update_cols = [
-                column for column in merge_cols if column not in business_keys
-            ]
-            merge_condition = " AND ".join(
-                f"target.{column} = source.{column}" for column in business_keys
-            )
-
-            delta_target.alias("target").merge(
-                source=df_batch.alias("source"), condition=merge_condition
-            ).whenMatchedUpdate(
-                set={column: f"source.{column}" for column in update_cols}
-            ).whenNotMatchedInsert(
-                values={column: f"source.{column}" for column in merge_cols}
-            ).execute()
-            print("  MERGE INTO de metas executado no Delta Lake Silver.")
-        else:
-            df_batch.write.format("delta").mode("append").save(meta_target_path)
-            print("  Eventos de metas gravados por append na Silver.")
-    else:
-        df_batch.write.mode("append").parquet(meta_target_path)
-        print("  Eventos de metas gravados na Silver em modo fallback.")
+    meta_output_path = (
+        f"{EVENTS_SILVER_BASE}metas/{domain}/batch_id={batch_id}/"
+    )
+    df_batch.write.mode("overwrite").parquet(meta_output_path)
+    print(f"  └─  Evento de meta gravado em destino isolado: {meta_output_path}")
 
     processed_metas_count += batch_count
     processed_metas_by_domain[domain] += batch_count
@@ -624,15 +695,10 @@ def process_student_stream():
             print(
                 f" ├─ [Domínio: Alunos] Streaming com schema explícito e checkpointLocation em: {checkpoint_alunos}"
             )
-            read_stream_alunos = spark.readStream.schema(EVENTOS_ALUNOS_SCHEMA).option(
-                "mode", "FAILFAST"
+            df_stream_alunos = _read_events_stream(
+                alunos_landing,
+                EVENTOS_ALUNOS_SCHEMA,
             )
-            if not LOCAL_MODE:
-                read_stream_alunos = read_stream_alunos.option(
-                    "recursiveFileLookup", "true"
-                )
-
-            df_stream_alunos = read_stream_alunos.json(alunos_landing)
 
             query_alunos = (
                 df_stream_alunos.writeStream.format("delta" if HAS_GLUE else "memory")
@@ -675,13 +741,10 @@ def process_meta_streams():
 
         print(f"  └─  Processando eventos encontrados em: {meta_path}")
         try:
-            read_metas = spark.readStream.schema(EVENTOS_METAS_SCHEMA).option(
-                "mode", "FAILFAST"
+            df_stream_metas = _read_events_stream(
+                meta_path,
+                EVENTOS_METAS_SCHEMA,
             )
-            if not LOCAL_MODE:
-                read_metas = read_metas.option("recursiveFileLookup", "true")
-
-            df_stream_metas = read_metas.json(meta_path)
             checkpoint_meta_path = (
                 os.path.join(CHECKPOINT_BASE, f"metas_{domain}")
                 if LOCAL_MODE
@@ -742,9 +805,25 @@ manifest_data = {
     "alunos_events_count": processed_alunos_count,
     "metas_events_count": processed_metas_count,
     "metas_events_by_domain": processed_metas_by_domain,
+    "total_events_quarantined": sum(quarantined_counts.values()),
+    "quarantined_events_by_domain": quarantined_counts,
+    "quarantine_s3_prefix": (
+        f"s3://{S3_BUCKET}/{QUARANTINE_BASE.removeprefix(f's3://{S3_BUCKET}/')}"
+        if not LOCAL_MODE
+        else None
+    ),
+    "quarantine_retention_days": QUARANTINE_RETENTION_DAYS,
+    "events_silver_run_prefix": EVENTS_SILVER_BASE,
+    "publication_status": "COMMITTED",
+    "quarantine_status": (
+        "REVIEW_REQUIRED" if sum(quarantined_counts.values()) else "EMPTY"
+    ),
     "latency_metrics_seconds": latency_stats,
     "streaming_engine": "Spark Structured Streaming (Trigger AvailableNow + checkpointLocation)",
-    "message": "Eventos integrados  no Delta Lake com controle de offset por checkpoint.",
+    "message": (
+        "Eventos sintéticos válidos foram gravados em destino isolado; "
+        "payloads inválidos foram preservados para reprocessamento."
+    ),
 }
 
 if not LOCAL_MODE and HAS_BOTO3:
@@ -760,45 +839,8 @@ if not LOCAL_MODE and HAS_BOTO3:
         f" [Auditoria Eventos] Manifesto salvo no S3: s3://{S3_BUCKET}/{manifest_key}"
     )
 
-    # A atualização na Silver deve invalidar o short-circuit da Gold.
-    if total_processed > 0:
-        silver_manifest_data = {
-            "job_name": job_name,
-            "run_id": run_id,
-            "ingestion_date": ingestion_date,
-            "status": "SUCCEEDED",
-            "total_events_processed": total_processed,
-            "message": "Atualização incremental via Streaming Events integrada à Camada Silver.",
-        }
-        silver_manifest_key = f"auditoria/silver/ingestion_date={ingestion_date}/run_id={run_id}/manifest.json"
-        s3_client.put_object(
-            Bucket=S3_BUCKET,
-            Key=silver_manifest_key,
-            Body=json.dumps(silver_manifest_data, indent=2),
-            ContentType="application/json",
-        )
-        print(
-            f" [Governança Silver] Manifesto de atualização ativado para a Camada Gold: s3://{S3_BUCKET}/{silver_manifest_key}"
-        )
 else:
     os.makedirs(AUDIT_PATH, exist_ok=True)
     with open(os.path.join(AUDIT_PATH, f"manifest_{run_id}.json"), "w") as f:
         json.dump(manifest_data, f, indent=2)
     print(f" [Auditoria Eventos] Manifesto salvo localmente em: {AUDIT_PATH}")
-
-    if total_processed > 0:
-        silver_audit_dir = "data/auditoria/silver/"
-        os.makedirs(silver_audit_dir, exist_ok=True)
-        silver_manifest_data = {
-            "job_name": job_name,
-            "run_id": run_id,
-            "ingestion_date": ingestion_date,
-            "status": "SUCCEEDED",
-            "total_events_processed": total_processed,
-            "message": "Atualização incremental via Streaming Events.",
-        }
-        with open(os.path.join(silver_audit_dir, f"manifest_{run_id}.json"), "w") as f:
-            json.dump(silver_manifest_data, f, indent=2)
-        print(
-            f" [Governança Silver] Manifesto de atualização salvo localmente em: {silver_audit_dir}"
-        )

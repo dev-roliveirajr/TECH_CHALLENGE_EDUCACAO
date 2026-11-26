@@ -1,3 +1,4 @@
+import json
 import importlib.util
 import sys
 from pathlib import Path
@@ -116,9 +117,15 @@ def test_lifecycle_setup_preserves_unrelated_rules(deploy_module, monkeypatch):
                         "Expiration": {"Days": 90},
                     },
                     {
-                        "ID": "ExpireRawLandingZoneEventsAfter7Days",
+                        "ID": "ExpireRawLandingZoneEvents",
                         "Status": "Enabled",
                         "Filter": {"Prefix": "old/"},
+                        "Expiration": {"Days": 30},
+                    },
+                    {
+                        "ID": "ExpireEventQuarantine",
+                        "Status": "Enabled",
+                        "Filter": {"Prefix": "old-quarantine/"},
                         "Expiration": {"Days": 30},
                     },
                 ]
@@ -128,6 +135,7 @@ def test_lifecycle_setup_preserves_unrelated_rules(deploy_module, monkeypatch):
     monkeypatch.setattr(deploy_module, "s3_client", client)
     monkeypatch.setattr(deploy_module, "S3_BUCKET", "literacy-data")
     monkeypatch.setattr(deploy_module, "LIFECYCLE_RULES_EXPIRATION_DAYS", 7)
+    monkeypatch.setattr(deploy_module, "QUARANTINE_RETENTION_DAYS", 10)
 
     deploy_module.setup_s3_lifecycle_rules()
 
@@ -136,6 +144,70 @@ def test_lifecycle_setup_preserves_unrelated_rules(deploy_module, monkeypatch):
     ]["Rules"]
     assert [rule["ID"] for rule in rules] == [
         "KeepExistingRule",
-        "ExpireRawLandingZoneEventsAfter7Days",
+        "ExpireRawLandingZoneEvents",
+        "ExpireEventQuarantine",
     ]
-    assert rules[-1]["Filter"]["Prefix"] == "bronze/events_raw_landing/"
+    assert rules[-2]["Filter"]["Prefix"] == "bronze/events_raw_landing/"
+    assert rules[-1]["Filter"]["Prefix"] == "silver/quarantine/events/"
+    assert rules[-1]["Expiration"]["Days"] == 10
+
+
+def test_cloudwatch_alarms_publish_to_idempotent_sns_subscription(
+    deploy_module, monkeypatch
+):
+    sns = MagicMock()
+    sns.create_topic.return_value = {"TopicArn": "arn:aws:sns:us-east-1:123:alerts"}
+    sns.get_topic_attributes.return_value = {
+        "Attributes": {
+            "Policy": json.dumps(
+                {"Version": "2012-10-17", "Statement": [{"Sid": "Owner"}]}
+            )
+        }
+    }
+    sns.list_subscriptions_by_topic.side_effect = [
+        {"Subscriptions": []},
+    ]
+    sns.subscribe.return_value = {"SubscriptionArn": "PendingConfirmation"}
+    cloudwatch = MagicMock()
+    monkeypatch.setattr(deploy_module, "sns_client", sns)
+    monkeypatch.setattr(deploy_module, "cw_client", cloudwatch)
+    monkeypatch.setattr(deploy_module, "raw_bucket_name", "literacy-data")
+    monkeypatch.setattr(deploy_module, "AWS_ACCOUNT_ID", "123456789012")
+    monkeypatch.setattr(deploy_module, "AWS_REGION", "us-east-1")
+    monkeypatch.setenv("NOTIFICATION_EMAIL", "ops@example.org")
+    monkeypatch.delenv("SNS_ALERT_EMAIL", raising=False)
+
+    deploy_module.setup_cloudwatch_alarms()
+
+    sns.create_topic.assert_called_once()
+    sns.subscribe.assert_called_once_with(
+        TopicArn="arn:aws:sns:us-east-1:123:alerts",
+        Protocol="email",
+        Endpoint="ops@example.org",
+        ReturnSubscriptionArn=True,
+    )
+    saved_policy = json.loads(
+        sns.set_topic_attributes.call_args.kwargs["AttributeValue"]
+    )
+    assert {statement["Sid"] for statement in saved_policy["Statement"]} == {
+        "Owner",
+        "AllowProjectCloudWatchAlarms",
+    }
+    assert cloudwatch.put_metric_alarm.call_count == 4
+    for alarm_call in cloudwatch.put_metric_alarm.call_args_list:
+        assert alarm_call.kwargs["AlarmActions"] == [
+            "arn:aws:sns:us-east-1:123:alerts"
+        ]
+        assert alarm_call.kwargs["OKActions"] == [
+            "arn:aws:sns:us-east-1:123:alerts"
+        ]
+
+
+def test_cloudwatch_alarms_require_notification_email(
+    deploy_module, monkeypatch
+):
+    monkeypatch.delenv("SNS_ALERT_EMAIL", raising=False)
+    monkeypatch.delenv("NOTIFICATION_EMAIL", raising=False)
+
+    with pytest.raises(ValueError, match="SNS_ALERT_EMAIL"):
+        deploy_module.setup_cloudwatch_alarms()

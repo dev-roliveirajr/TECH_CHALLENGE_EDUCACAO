@@ -6,9 +6,57 @@ Funções para verificar junções, valores nulos, duplicidades e divergências.
 ===============================================================================
 """
 
+import json
+from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple
+
+from botocore.exceptions import ClientError
 from pyspark.sql import DataFrame, Window
 import pyspark.sql.functions as F
+
+
+def quality_check_result(
+    rule_id,
+    scope,
+    status,
+    blocking,
+    threshold=None,
+    observed=None,
+    denominator=None,
+    source=None,
+    detail=None,
+):
+    """Cria um resultado estruturado e serializável para uma regra de qualidade."""
+    if status not in {"PASS", "FAIL", "WARN", "NOT_APPLICABLE"}:
+        raise ValueError(f"Status de regra de qualidade inválido: {status!r}.")
+    return {
+        "rule_id": rule_id,
+        "scope": scope,
+        "status": status,
+        "blocking": bool(blocking),
+        "threshold": threshold,
+        "observed": observed,
+        "denominator": denominator,
+        "source": source,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "detail": detail,
+    }
+
+
+def persist_quality_report(s3_client, bucket_name, key, report):
+    """Persiste relatório de qualidade; falhas de escrita são explícitas."""
+    try:
+        s3_client.put_object(
+            Bucket=bucket_name,
+            Key=key,
+            Body=json.dumps(report, indent=2, ensure_ascii=False).encode("utf-8"),
+            ContentType="application/json",
+        )
+    except ClientError as error:
+        raise RuntimeError(
+            f"Não foi possível gravar o relatório de qualidade "
+            f"s3://{bucket_name}/{key}."
+        ) from error
 
 
 def check_join_ratio(
@@ -175,6 +223,11 @@ def check_cross_validation(
 
     if total_records == 0:
         print(" [VALIDAÇÃO CRUZADA] Sem registros pareados para comparação.")
+        if raise_on_failure:
+            raise ValueError(
+                "Validação cruzada bloqueada: não há registros pareados entre "
+                "a taxa recalculada e a taxa publicada."
+            )
         return 0.0, {"total_records": 0, "avg_divergence": 0.0}
 
     # Diferença absoluta entre taxa calculada pelo aluno e taxa publicada pelo município

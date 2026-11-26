@@ -11,6 +11,7 @@ import sys
 import os
 import json
 import datetime
+import re
 import boto3
 from botocore.exceptions import ClientError
 from awsglue.context import GlueContext
@@ -25,13 +26,16 @@ from gold_aggregation import (
     compare_to_official_target,
     should_skip_gold_processing,
 )
-from manifest_lib import get_latest_manifest
-
-# Importa funções de validação cruzada e governança da biblioteca de qualidade
-try:
-    from quality_lib import check_cross_validation
-except ImportError:
-    check_cross_validation = None
+from manifest_lib import (
+    get_latest_approved_gold_manifest,
+    get_latest_approved_silver_manifest,
+    get_latest_manifest,
+)
+from quality_lib import (
+    check_cross_validation,
+    persist_quality_report,
+    quality_check_result,
+)
 
 sc = SparkContext()
 glueContext = GlueContext(sc)
@@ -54,9 +58,25 @@ if not S3_BUCKET:
     raise ValueError("A variável/argumento S3_BUCKET_NAME não foi definida.")
 
 # Definição dos caminhos no S3
-SILVER_PATH = f"s3://{S3_BUCKET}/silver/alunos_curado/"
+SILVER_PATH = None
+TARGET_PATHS = {}
 GOLD_PATH = f"s3://{S3_BUCKET}/gold/"
 AUDIT_PATH = f"s3://{S3_BUCKET}/auditoria/gold/"
+SHARED_SERIES_CONFIRMED = (
+    os.getenv("OFFICIAL_TARGETS_SHARED_ACROSS_SERIES_CONFIRMED", "").lower()
+    == "true"
+)
+try:
+    gold_options = getResolvedOptions(
+        sys.argv,
+        ["OFFICIAL_TARGETS_SHARED_ACROSS_SERIES_CONFIRMED"],
+    )
+except Exception:
+    gold_options = {}
+SHARED_SERIES_CONFIRMED = gold_options.get(
+    "OFFICIAL_TARGETS_SHARED_ACROSS_SERIES_CONFIRMED",
+    str(SHARED_SERIES_CONFIRMED),
+).lower() == "true"
 
 run_id = os.getenv(
     "GLUE_RUN_ID",
@@ -85,17 +105,35 @@ def get_latest_silver_manifest(bucket_name):
 
 silver_manifest = get_latest_silver_manifest(S3_BUCKET)
 silver_status = silver_manifest.get("status") if silver_manifest else None
+latest_approved_silver_manifest = get_latest_approved_silver_manifest(
+    boto3.client("s3"),
+    S3_BUCKET,
+)
+if latest_approved_silver_manifest is None:
+    raise FileNotFoundError(
+        "Não há snapshot Silver oficial com publicação aprovada disponível."
+    )
+if (
+    latest_approved_silver_manifest.get("silver_transform_version")
+    != "2026-11-official-inputs-v2"
+):
+    raise ValueError(
+        "O snapshot Silver aprovado não atende à versão do contrato oficial "
+        "exigida pela Gold."
+    )
+SILVER_PATH = latest_approved_silver_manifest["official_student_s3_prefix"]
+TARGET_PATHS = latest_approved_silver_manifest["official_target_s3_prefixes"]
 
 gold_paths = {
-    "indicadores_municipais": f"{GOLD_PATH}gold_indicadores_municipais/",
-    "indicadores_uf": f"{GOLD_PATH}gold_indicadores_uf/",
-    "indicadores_brasil": f"{GOLD_PATH}gold_indicadores_brasil/",
-    "metas_municipais": f"{GOLD_PATH}gold_desempenho_vs_metas/",
-    "metas_uf": f"{GOLD_PATH}gold_desempenho_vs_metas_uf/",
-    "metas_brasil": f"{GOLD_PATH}gold_desempenho_vs_metas_brasil/",
-    "features_municipais": f"{GOLD_PATH}gold_features_alfabetizacao/",
-    "features_uf": f"{GOLD_PATH}gold_features_alfabetizacao_uf/",
-    "features_brasil": f"{GOLD_PATH}gold_features_alfabetizacao_brasil/",
+    "indicadores_municipais": f"{GOLD_PATH}runs/{run_id}/gold_indicadores_municipais/",
+    "indicadores_uf": f"{GOLD_PATH}runs/{run_id}/gold_indicadores_uf/",
+    "indicadores_brasil": f"{GOLD_PATH}runs/{run_id}/gold_indicadores_brasil/",
+    "metas_municipais": f"{GOLD_PATH}runs/{run_id}/gold_desempenho_vs_metas/",
+    "metas_uf": f"{GOLD_PATH}runs/{run_id}/gold_desempenho_vs_metas_uf/",
+    "metas_brasil": f"{GOLD_PATH}runs/{run_id}/gold_desempenho_vs_metas_brasil/",
+    "features_municipais": f"{GOLD_PATH}runs/{run_id}/gold_features_alfabetizacao/",
+    "features_uf": f"{GOLD_PATH}runs/{run_id}/gold_features_alfabetizacao_uf/",
+    "features_brasil": f"{GOLD_PATH}runs/{run_id}/gold_features_alfabetizacao_brasil/",
 }
 
 # Check de Short-Circuit para a Gold se a Silver deu SKIPPED e a Gold já existe
@@ -106,8 +144,15 @@ latest_gold_manifest = get_latest_manifest(
     "auditoria/gold/",
     "Camada Gold",
 )
+latest_approved_gold_manifest = get_latest_approved_gold_manifest(
+    s3_client,
+    S3_BUCKET,
+    required_datasets=gold_paths.keys(),
+)
 previous_transform_version = (
-    latest_gold_manifest.get("gold_transform_version") if latest_gold_manifest else None
+    latest_approved_gold_manifest.get("gold_transform_version")
+    if latest_approved_gold_manifest
+    else None
 )
 
 
@@ -124,43 +169,37 @@ def check_s3_path_has_objects(prefix):
 def _read_silver_dataset():
     print(f" 1. Lendo dataset curado da Camada Silver em: {SILVER_PATH}")
     try:
-        try:
-            dataframe = spark.read.format("delta").load(SILVER_PATH)
-            print(
-                "  └─  Conexão realizada via leitor Delta Lake nativo (_delta_log/ ativado)."
-            )
-        except Exception as delta_error:
-            print(
-                f"  └─  Aviso ao carregar como Delta ({delta_error}). "
-                "Recorrendo ao leitor Parquet..."
-            )
-            dataframe = spark.read.parquet(SILVER_PATH)
-        row_count = dataframe.count()
-        print(f"  └─  Registros ativos lidos do snapshot Silver: {row_count:,}")
-        return dataframe, row_count
+        dataframe = spark.read.format("delta").load(SILVER_PATH)
     except Exception as error:
         raise RuntimeError(
-            f" Falha ao carregar dados curados da Camada Silver: {str(error)}"
+            f"Falha ao carregar o snapshot Delta oficial da Camada Silver "
+            f"em '{SILVER_PATH}'. Fallback implícito para Parquet foi removido."
         ) from error
+    row_count = dataframe.count()
+    print(f"  └─  Registros ativos lidos do snapshot Silver oficial: {row_count:,}")
+    return dataframe, row_count
+
+
+def _read_official_targets():
+    return {
+        level: spark.read.format("delta").load(path)
+        for level, path in TARGET_PATHS.items()
+    }
 
 
 def _validate_indicators(df_indicadores_mun):
     print(" 3. Executando validação cruzada municipal com a taxa publicada...")
-    cv_passed = True
-    cv_diff = 0.0
-    if check_cross_validation:
-        try:
-            avg_divergence, _ = check_cross_validation(
-                df_recalculated=df_indicadores_mun,
-                calculated_col="taxa_alfabetizacao_recalculada",
-                published_col="taxa_alfabetizacao_oficial_inep",
-                max_divergence_percent=2.0,
-            )
-            cv_diff = float(avg_divergence)
-            cv_passed = cv_diff <= 2.0
-        except Exception as cv_error:
-            print(f"  └─  Alerta na Validação Cruzada: {str(cv_error)}")
-    return cv_passed, cv_diff
+    avg_divergence, metrics = check_cross_validation(
+        df_recalculated=df_indicadores_mun,
+        calculated_col="taxa_alfabetizacao_recalculada",
+        published_col="taxa_alfabetizacao_oficial_inep",
+        max_divergence_percent=2.0,
+    )
+    return (
+        metrics.get("total_records", 0) > 0 and avg_divergence <= 2.0,
+        float(avg_divergence),
+        metrics,
+    )
 
 
 def _write_gold_datasets(datasets):
@@ -185,21 +224,24 @@ def _register_gold_tables():
         ("gold_features_alfabetizacao_brasil", "features_brasil"),
     ]
 
+    safe_run_id = re.sub(r"[^A-Za-z0-9_]", "_", run_id)[:40]
     for table_name, dataset_name in catalog_tables:
         table_path = gold_paths[dataset_name]
         try:
             spark.sql(
-                f"CREATE TABLE IF NOT EXISTS `{GLUE_DATABASE_NAME}`.`{table_name}` "
+                f"CREATE TABLE IF NOT EXISTS `{GLUE_DATABASE_NAME}`."
+                f"`{table_name}_run_{safe_run_id}` "
                 f"USING PARQUET LOCATION '{table_path}'"
             )
             print(
-                f"  Tabela `{GLUE_DATABASE_NAME}`.`{table_name}` registrada no catálogo."
+                f"  Tabela `{GLUE_DATABASE_NAME}`."
+                f"`{table_name}_run_{safe_run_id}` registrada no catálogo."
             )
         except Exception as catalog_error:
-            print(
-                f" Aviso ao registrar tabela '{table_name}' no Catalog: "
-                f"{catalog_error}"
-            )
+            raise RuntimeError(
+                f"Não foi possível registrar a tabela Gold versionada "
+                f"'{table_name}_run_{safe_run_id}'."
+            ) from catalog_error
 
 
 def _save_gold_manifest(manifest_content):
@@ -226,9 +268,7 @@ def _save_gold_manifest(manifest_content):
         ) from manifest_error
 
 
-gold_already_built = all(
-    check_s3_path_has_objects(path) for path in gold_paths.values()
-)
+gold_already_built = latest_approved_gold_manifest is not None
 
 if should_skip_gold_processing(
     silver_status,
@@ -246,11 +286,14 @@ if should_skip_gold_processing(
         "run_id": run_id,
         "ingestion_date": ingestion_date,
         "status": "SKIPPED (Already Up-to-Date)",
+        "gate_status": "APPROVED",
+        "publication_status": "COMMITTED",
+        "quality_gate_passed": True,
         "gold_transform_version": GOLD_TRANSFORM_VERSION,
         "timestamp_utc": datetime.datetime.utcnow().isoformat(),
-        "message": "Nenhuma alteração na Silver. Datasets Gold mantidos sem re-computação.",
+        "message": "Nenhuma alteração na Silver. O último run Gold aprovado foi mantido.",
         "gold_s3_prefixes": {
-            **gold_paths,
+            **latest_approved_gold_manifest["gold_s3_prefixes"],
         },
     }
     manifest_s3_key = (
@@ -272,6 +315,17 @@ if should_skip_gold_processing(
 else:
     # 1. Leitura do Dataset Curado da Camada Silver
     df_silver, total_silver_rows = _read_silver_dataset()
+    if "_source" not in df_silver.columns:
+        raise ValueError("A Silver oficial não contém a coluna de proveniência '_source'.")
+    non_official_rows = df_silver.filter(
+        F.col("_source").isNull()
+        | (F.col("_source") != F.lit("basedosdados_bigquery"))
+    ).limit(1).count()
+    if non_official_rows:
+        raise ValueError(
+            "A Gold oficial recebeu linhas sem proveniência "
+            "basedosdados_bigquery; a agregação foi bloqueada."
+        )
 
     # 2. Agregação ponderada em três níveis geográficos.
     print(" 2. Calculando indicadores ponderados municipais, estaduais e nacionais...")
@@ -317,20 +371,54 @@ else:
     )
 
     # 3. Validação cruzada disponível apenas no nível municipal.
-    cv_passed, cv_diff = _validate_indicators(df_indicadores_mun)
+    cv_passed, cv_diff, cv_metrics = _validate_indicators(df_indicadores_mun)
 
-    # 4. Compara somente redes compatíveis com o dicionário das metas.
-    print(" 4. Construindo comparativos contra a meta oficial de 80%...")
-
-    df_desempenho_metas = compare_to_official_target(df_indicadores_mun, "3")
-    df_desempenho_metas_uf = compare_to_official_target(
-        df_indicadores_uf_public,
-        "5",
-    )
-    df_desempenho_metas_brasil = compare_to_official_target(
-        df_indicadores_brasil_public,
-        "5",
-    )
+    # 4. Compara redes compatíveis contra metas oficiais do respectivo ano.
+    print(" 4. Construindo comparativos contra as metas oficiais anuais...")
+    official_targets = _read_official_targets()
+    try:
+        df_desempenho_metas = compare_to_official_target(
+            df_indicadores_mun,
+            official_targets["municipio"],
+            "3",
+            shared_across_series_confirmed=SHARED_SERIES_CONFIRMED,
+        )
+        df_desempenho_metas_uf = compare_to_official_target(
+            df_indicadores_uf_public,
+            official_targets["uf"],
+            "5",
+            shared_across_series_confirmed=SHARED_SERIES_CONFIRMED,
+        )
+        df_desempenho_metas_brasil = compare_to_official_target(
+            df_indicadores_brasil_public,
+            official_targets["brasil"],
+            "5",
+            shared_across_series_confirmed=SHARED_SERIES_CONFIRMED,
+        )
+    except ValueError as error:
+        failed_report = {
+            "run_id": run_id,
+            "layer": "gold",
+            "status": "FAILED",
+            "checks": [
+                quality_check_result(
+                    rule_id="GOLD-OFFICIAL-TARGET-CONTRACT",
+                    scope="all",
+                    status="FAIL",
+                    blocking=True,
+                    source="official_silver_target_contract",
+                    detail=str(error),
+                )
+            ],
+        }
+        persist_quality_report(
+            s3_client,
+            S3_BUCKET,
+            f"auditoria/gold/ingestion_date={ingestion_date}/run_id={run_id}/"
+            "quality_report.json",
+            failed_report,
+        )
+        raise
     meta_datasets = {
         "metas_municipais": df_desempenho_metas,
         "metas_uf": df_desempenho_metas_uf,
@@ -359,7 +447,62 @@ else:
         + ", ".join(f"{name}={count:,}" for name, count in feature_counts.items())
     )
 
-    # 6. Gravação dos datasets Gold no S3.
+    expected_comparison_counts = {
+        "metas_municipais": df_indicadores_mun.filter(F.col("rede") == "3").count(),
+        "metas_uf": df_indicadores_uf_public.count(),
+        "metas_brasil": df_indicadores_brasil_public.count(),
+    }
+    comparison_counts = {
+        name: dataframe.count() for name, dataframe in meta_datasets.items()
+    }
+    comparison_count_passed = all(
+        comparison_counts[name] == expected
+        for name, expected in expected_comparison_counts.items()
+    )
+    quality_checks = [
+        quality_check_result(
+            rule_id="GOLD-CROSS-VALIDATION",
+            scope="municipio",
+            status="PASS" if cv_passed else "FAIL",
+            blocking=True,
+            threshold=2.0,
+            observed=cv_diff,
+            denominator=cv_metrics.get("total_records"),
+            source="taxa_alfabetizacao_recalculada_vs_publicada",
+            detail=cv_metrics,
+        ),
+        quality_check_result(
+            rule_id="GOLD-COMPARISON-GRAIN",
+            scope="all",
+            status="PASS" if comparison_count_passed else "FAIL",
+            blocking=True,
+            observed=comparison_counts,
+            denominator=expected_comparison_counts,
+            source="indicator_to_target_left_join",
+            detail="Comparativos devem preservar o número de linhas dos indicadores.",
+        ),
+    ]
+    quality_report = {
+        "run_id": run_id,
+        "layer": "gold",
+        "status": "APPROVED"
+        if all(
+            check["status"] in {"PASS", "NOT_APPLICABLE"}
+            or not check["blocking"]
+            for check in quality_checks
+        )
+        else "FAILED",
+        "checks": quality_checks,
+    }
+    quality_report_key = (
+        f"auditoria/gold/ingestion_date={ingestion_date}/run_id={run_id}/"
+        "quality_report.json"
+    )
+    persist_quality_report(s3_client, S3_BUCKET, quality_report_key, quality_report)
+    if quality_report["status"] != "APPROVED":
+        raise ValueError("Gates de qualidade Gold reprovados; execução não promovida.")
+
+    # 6. Gravação dos datasets Gold sob um prefixo imutável do run.
     gold_datasets = {
         **indicator_datasets,
         **meta_datasets,
@@ -374,6 +517,8 @@ else:
         "run_id": run_id,
         "ingestion_date": ingestion_date,
         "status": "SUCCEEDED",
+        "gate_status": "APPROVED",
+        "publication_status": "COMMITTED",
         "gold_transform_version": GOLD_TRANSFORM_VERSION,
         "timestamp_utc": datetime.datetime.utcnow().isoformat(),
         "input_rows_silver": total_silver_rows,
@@ -397,7 +542,10 @@ else:
         },
         "cross_validation_passed": cv_passed,
         "cross_validation_diff_percent": round(cv_diff, 4),
-        "target_meta_pactuada": "80.0%",
+        "cross_validation_metrics": cv_metrics,
+        "quality_report_s3_uri": f"s3://{S3_BUCKET}/{quality_report_key}",
+        "comparison_product_role": "descriptive_comparison_not_training_features",
+        "target_contract": "official_annual_targets_by_geography_network_year",
         "gold_s3_prefixes": {
             **gold_paths,
         },

@@ -16,6 +16,7 @@ import re
 import boto3
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
+from monitor.finops import build_finops_measurements
 
 load_dotenv(override=True)
 
@@ -27,9 +28,6 @@ if AWS_ACCOUNT_ID and AWS_ACCOUNT_ID not in S3_BUCKET_NAME:
     FULL_BUCKET_NAME = f"{S3_BUCKET_NAME}-{AWS_ACCOUNT_ID}-{AWS_REGION}"
 else:
     FULL_BUCKET_NAME = S3_BUCKET_NAME
-
-COST_PER_DPU_HOUR = 0.44  # Custo médio AWS Glue G.1X DPU-Hora em USD
-
 
 def _as_utc(value):
     if value.tzinfo is None:
@@ -182,10 +180,16 @@ def _build_events_summary(manifest_data: dict | None):
 
     latency = manifest_data.get("latency_metrics_seconds", {})
     domain_counts = manifest_data.get("metas_events_by_domain", {})
+    quarantined = manifest_data.get("quarantined_events_by_domain", {})
+    quarantine_total = manifest_data.get("total_events_quarantined")
     content = f"""| Métrica de Eventos | Valor |
 | :--- | :---: |
 | **Status** | `{manifest_data.get("status", "N/A")}` |
 | **Total processado** | **{manifest_data.get("total_events_processed", "N/A")}** |
+| **Total em quarentena** | **{quarantine_total if quarantine_total is not None else "N/A"}** |
+| **Quarentena por domínio** | **{_format_level_counts(quarantined) or "N/A"}** |
+| **Retenção de quarentena** | **{manifest_data.get("quarantine_retention_days", "N/A")} dias** |
+| **Destino de eventos** | `{manifest_data.get("events_silver_run_prefix", "N/A")}` |
 | **Eventos de alunos** | **{manifest_data.get("alunos_events_count", "N/A")}** |
 | **Eventos de metas** | **{manifest_data.get("metas_events_count", "N/A")}** |
 | **Metas por município / UF / Brasil** | **{domain_counts.get("municipio", "N/A")} / {domain_counts.get("uf", "N/A")} / {domain_counts.get("brasil", "N/A")}** |
@@ -240,7 +244,14 @@ def _build_gold_summary(manifest_data: dict):
         manifest_data.get("output_rows_features_by_level", {})
     )
     cv_status = _format_cross_validation_status(manifest_data, skipped)
-    meta_ref = manifest_data.get("target_meta_pactuada", "80.0%")
+    meta_ref = manifest_data.get(
+        "target_contract",
+        "Metas oficiais anuais por território, rede e ano-alvo",
+    )
+    product_role = manifest_data.get(
+        "comparison_product_role",
+        "descriptive_comparison_not_training_features",
+    )
     gold_prefixes = manifest_data.get("gold_s3_prefixes", {})
     destinations = (
         "<br>".join(f"{name}: `{prefix}`" for name, prefix in gold_prefixes.items())
@@ -249,12 +260,12 @@ def _build_gold_summary(manifest_data: dict):
     )
     content = f"""| Métrica Analítica / Governança | Valor Registrado | Observação de Engenharia |
 | :--- | :---: | :--- |
-| **Linhas Lidas da Silver** | **{in_rows}** | Registros curados da tabela `alunos_curado` |
+| **Linhas Lidas da Silver** | **{in_rows}** | Snapshot oficial aprovado no manifesto Silver |
 | **Indicadores Ponderados (Município/UF/Brasil)** | **{out_ind}** | {indicator_breakdown or "Agregação ponderada pelo peso do aluno"} |
-| **Comparativos de Metas (Município/UF/Brasil)** | **{out_metas}** | {meta_breakdown or "Comparação com a meta oficial de 80%"} |
-| **Feature Stores (Município/UF/Brasil)** | **{out_feat}** | {feature_breakdown or "Registros gravados nos conjuntos de características"} |
+| **Comparativos de Metas (Município/UF/Brasil)** | **{out_metas}** | {meta_breakdown or "Comparação com metas oficiais anuais"} |
+| **Exports analíticos legados (Município/UF/Brasil)** | **{out_feat}** | {feature_breakdown or "Produtos descritivos; não são features de treinamento"} |
 | **Validação Cruzada (Microdado vs. Inep)** | **{cv_status}** | Batimento da taxa recalculada vs. oficial |
-| **Meta Oficial de Referência** | **{meta_ref}** | Meta de 2030; redes compatíveis conforme dicionário oficial |
+| **Contrato de metas** | **{meta_ref}** | Produto: `{product_role}` |
 | **Destinos S3 Gold** | {destinations} | Localização dos conjuntos de saída |
 """
     return title, content
@@ -342,8 +353,11 @@ def _build_silver_summary(manifest_data: dict):
     out_rows = metric_or_not_run(output_rows, lambda value: f"{value:,}")
     match_ratio_text = metric_or_not_run(match_ratio, lambda value: f"{value:.2f}%")
     silver_uri = manifest_data.get(
-        "silver_s3_prefix",
-        manifest_data.get("s3_path", f"s3://{FULL_BUCKET_NAME}/silver/alunos_curado/"),
+        "official_student_s3_prefix",
+        manifest_data.get(
+            "silver_s3_prefix",
+            manifest_data.get("s3_path", f"s3://{FULL_BUCKET_NAME}/silver/runs/"),
+        ),
     )
     null_handling = (
         "Não reexecutado (conjunto existente mantido)" if skipped else "Preservado"
@@ -360,7 +374,7 @@ def _build_silver_summary(manifest_data: dict):
 | **Taxa de correspondência do JOIN** | **{match_ratio_text}** | Percentual de registros correspondentes |
 | **Resultado da verificação do JOIN** | **{qg_status}** | Limite configurado em `check_join_ratio`; não reexecutada quando a camada foi ignorada |
 | **Tratamento de NULOs** | **{null_handling}** | Valores existentes são mantidos quando o job é ignorado |
-| **Status das Metas** | **{goal_status}** | 'Atingiu', 'Não Atingiu' ou 'Sem Meta Cadastrada' |
+| **Status das metas** | **{goal_status}** | Comparativos Gold usam contrato anual; sem meta não vira zero |
 | **Destino S3** | `{silver_uri}` | Formato Delta Lake, sem partição por data configurada pelo job |
 """
     return title, content
@@ -380,7 +394,7 @@ def generate_job_report(
 
         status = job_run.get("JobRunState", "UNKNOWN")
         execution_time = job_run.get("ExecutionTime", 0)
-        dpu_seconds = job_run.get("DPUSeconds", 0)
+        dpu_seconds = job_run.get("DPUSeconds")
         error_message = job_run.get("ErrorMessage", "")
 
         started_on = job_run.get("StartedOn")
@@ -393,10 +407,50 @@ def generate_job_report(
         completed_str = _format_utc_timestamp(completed_on)
 
         # Cálculo do custo de execução
-        dpu_hours = (
-            dpu_seconds / 3600.0 if dpu_seconds else (execution_time / 3600.0) * 2.0
+        finops_measurements = build_finops_measurements(
+            job_name=job_name,
+            run_id=run_id,
+            execution_time_seconds=execution_time,
+            dpu_seconds=dpu_seconds,
+            period_start=started_on,
+            period_end=completed_on,
         )
-        cost_usd = dpu_hours * COST_PER_DPU_HOUR
+        glue_measurement = finops_measurements[0]
+        dpu_hours = glue_measurement["quantity"]
+        dpu_hours_text = (
+            f"{dpu_hours:.4f} DPU-h ({glue_measurement['quantity_status']})"
+            if dpu_hours is not None
+            else "N/A (métrica indisponível)"
+        )
+        cost_usd = glue_measurement["cost_amount"]
+        glue_cost_text = (
+            f"US$ {cost_usd:.4f} (estimado)"
+            if cost_usd is not None
+            else "N/A (custo indisponível)"
+        )
+        finops_rows = "\n".join(
+            "| {provider} | {service} | {metric} | {quantity} | {unit} | "
+            "{cost} | `{status}` | {source} |".format(
+                provider=measurement["provider"],
+                service=measurement["service"],
+                metric=measurement["metric"],
+                quantity=(
+                    f"{measurement['quantity']:.4f}"
+                    if measurement["quantity"] is not None
+                    else "N/A"
+                ),
+                unit=measurement["unit"],
+                cost=(
+                    f"{measurement['currency']} "
+                    f"{measurement['cost_amount']:.4f}"
+                    if measurement["cost_amount"] is not None
+                    else "N/A"
+                ),
+                status=measurement["measurement_status"],
+                source=measurement["source_reference"],
+            )
+            for measurement in finops_measurements
+        )
 
         logs_text = fetch_stdout_cloudwatch_logs(run_id)
         manifest_data, manifest_key = fetch_s3_manifest(
@@ -405,11 +459,11 @@ def generate_job_report(
         layer = _job_layer(job_name)
 
         if layer == "gold":
-            origin_desc = "Camada Silver (Parquet / S3 em alunos_curado/)"
+            origin_desc = "Snapshot oficial aprovado da Camada Silver (Delta / S3)"
         elif layer == "silver":
             origin_desc = "Camada Bronze (Parquet / S3 via Manifesto)"
         elif layer == "events":
-            origin_desc = "S3 Landing Zone (arquivos NDJSON de eventos)"
+            origin_desc = "S3 Landing Zone (eventos sintéticos NDJSON)"
         else:
             origin_desc = "GCP BigQuery (basedosdados.br_inep_avaliacao_alfabetizacao)"
 
@@ -443,21 +497,29 @@ def generate_job_report(
 
 ---
 
-## 2. Métricas de execução e custo (AWS Glue)
+## 2. FinOps: consumo medido, estimado e indisponível
 | Métrica | Valor Medido |
 | :--- | :--- |
 | **Status da Execução** | `{status}` |
 | **Duração Total** | **{execution_time} segundos** (~{execution_time/60.0:.2f} min) |
-| **DPU-Horas Medidas** | **{dpu_hours:.4f} DPU-h** (2.0 DPUs Worker Type G.1X) |
-| **Custo Estimado AWS Glue** | **US$ {cost_usd:.4f}** |
+| **DPU-Horas** | **{dpu_hours_text}** |
+| **Custo Estimado AWS Glue** | **{glue_cost_text}** |
 | **Início / Término** | {started_str} ➔ {completed_str} |
+
+| Provedor | Serviço | Métrica | Quantidade | Unidade | Custo | Status | Fonte/limitação |
+| :--- | :--- | :--- | :---: | :--- | :---: | :--- | :--- |
+{finops_rows}
+
+O preço de Glue usado no cálculo é US$ {glue_measurement["price_unit_amount"]:.2f}/DPU-h
+(`{glue_measurement["price_source"]}`). A estimativa não é custo faturado. Bytes
+BigQuery (processados, faturados e lidos) e egress GCP → AWS permanecem
+indisponíveis até validar telemetria e Billing Export; `N/A` não representa zero.
 
 ---
 
-## 3.  Consumo e Origem dos Dados
+## 3. Consumo e origem dos dados
 * **Camada de Origem:** `{origin_desc}`
-* **Custos de serviços de origem:** Não medidos por este relatório.
-* **Rastreabilidade:** Manifestos JSON registram os dados de execução.
+* **Rastreabilidade:** Manifestos JSON registram execução e publicação.
 
 ---
 

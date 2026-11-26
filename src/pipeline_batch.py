@@ -11,15 +11,13 @@ polling e aplica travas de fallback (interrompe o fluxo em caso de falha).
 import os
 import sys
 import time
-import shutil
-import tempfile
 import datetime
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import boto3
-import pandas as pd
 from dotenv import load_dotenv
+from common.gold_sync import sync_committed_gold
 from monitor.report_generator import generate_job_report
 
 # Carrega variáveis de ambiente do .env
@@ -152,81 +150,17 @@ def _fetch_and_print_job_logs(
 
 
 def sync_gold_features_locally():
-    """
-    Sincroniza e consolida os datasets Parquet da Camada Gold do S3 para a pasta local
-    'data/features/', unificando as partições dispersas em arquivos .parquet únicos:
-      - data/features/gold_features_alfabetizacao.parquet
-      - data/features/gold_features_alfabetizacao_uf.parquet
-      - data/features/gold_features_alfabetizacao_brasil.parquet
-      - data/features/gold_indicadores_municipais.parquet
-      - data/features/gold_indicadores_uf.parquet
-      - data/features/gold_indicadores_brasil.parquet
-      - data/features/gold_desempenho_vs_metas.parquet
-      - data/features/gold_desempenho_vs_metas_uf.parquet
-      - data/features/gold_desempenho_vs_metas_brasil.parquet
-    """
+    """Sincroniza localmente os datasets do último manifesto Gold aprovado."""
     print("\n--------------------------------------------------")
     print(
         " Sincronizando e consolidando datasets Gold localmente em 'data/features/'..."
     )
-    print("--------------------------------------------------")
+    print("--------------------------------------------------"    )
 
     s3_client = get_s3_client()
     local_output_dir = os.path.join(os.getcwd(), "data", "features")
-    os.makedirs(local_output_dir, exist_ok=True)
-
-    gold_datasets = {
-        "gold_features_alfabetizacao": "gold/gold_features_alfabetizacao/",
-        "gold_features_alfabetizacao_uf": "gold/gold_features_alfabetizacao_uf/",
-        "gold_features_alfabetizacao_brasil": "gold/gold_features_alfabetizacao_brasil/",
-        "gold_indicadores_municipais": "gold/gold_indicadores_municipais/",
-        "gold_indicadores_uf": "gold/gold_indicadores_uf/",
-        "gold_indicadores_brasil": "gold/gold_indicadores_brasil/",
-        "gold_desempenho_vs_metas": "gold/gold_desempenho_vs_metas/",
-        "gold_desempenho_vs_metas_uf": "gold/gold_desempenho_vs_metas_uf/",
-        "gold_desempenho_vs_metas_brasil": "gold/gold_desempenho_vs_metas_brasil/",
-    }
-
-    for dataset_name, s3_prefix in gold_datasets.items():
-        temp_dir = tempfile.mkdtemp()
-        try:
-            paginator = s3_client.get_paginator("list_objects_v2")
-            parquet_keys = [
-                obj["Key"]
-                for page in paginator.paginate(
-                    Bucket=FULL_BUCKET_NAME,
-                    Prefix=s3_prefix,
-                )
-                for obj in page.get("Contents", [])
-                if obj["Key"].endswith(".parquet")
-                and not obj["Key"].split("/")[-1].startswith(".")
-            ]
-            if not parquet_keys:
-                print(f" Aviso: Nenhum arquivo Parquet encontrado em {s3_prefix}.")
-                continue
-
-            # Baixa as partes do S3 para o diretório temporário
-            downloaded_files = []
-            for i, key in enumerate(parquet_keys):
-                local_tmp_file = os.path.join(temp_dir, f"part_{i}.parquet")
-                s3_client.download_file(FULL_BUCKET_NAME, key, local_tmp_file)
-                downloaded_files.append(local_tmp_file)
-
-            # Consolidando arquivos usando Pandas
-            dfs = [pd.read_parquet(f) for f in downloaded_files]
-            df_consolidated = pd.concat(dfs, ignore_index=True)
-
-            # Salvando como arquivo único .parquet
-            target_file_path = os.path.join(local_output_dir, f"{dataset_name}.parquet")
-            df_consolidated.to_parquet(target_file_path, index=False)
-            print(
-                f"  └─  Dataset consolidado salvo : {target_file_path} ({len(df_consolidated):,} linhas)"
-            )
-
-        except Exception as e:
-            print(f" Alerta: Falha ao sincronizar {dataset_name}: {str(e)}")
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+    run_id = sync_committed_gold(s3_client, FULL_BUCKET_NAME, local_output_dir)
+    print(f"  └─  Datasets sincronizados do run Gold comprometido: {run_id}")
 
     print("--------------------------------------------------\n")
 

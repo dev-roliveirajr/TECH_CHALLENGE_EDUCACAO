@@ -11,6 +11,7 @@ JOIN e verificação da taxa de correspondência.
 import sys
 import os
 import json
+import re
 import boto3
 import datetime
 from botocore.exceptions import ClientError
@@ -25,7 +26,13 @@ from quality_lib import (
     check_join_ratio,
     deduplicate_by_window,
 )
-from manifest_lib import get_latest_bronze_manifest, validate_bronze_manifest
+from manifest_lib import (
+    get_latest_approved_silver_manifest,
+    get_latest_bronze_manifest,
+    validate_bronze_manifest,
+)
+from gold_aggregation import normalize_official_targets
+from quality_lib import persist_quality_report, quality_check_result
 
 sc = SparkContext()
 glueContext = GlueContext(sc)
@@ -63,11 +70,39 @@ if not S3_BUCKET:
 
 JOIN_THRESHOLD = float(os.getenv("JOIN_MATCH_THRESHOLD", "95.0"))
 BLOCK_ON_FAILURE = os.getenv("BLOCK_ON_QUALITY_FAILURE", "true").lower() == "true"
+SILVER_TRANSFORM_VERSION = "2026-11-official-inputs-v2"
+try:
+    silver_options = getResolvedOptions(
+        sys.argv,
+        [
+            "JOIN_MATCH_THRESHOLD",
+            "BLOCK_ON_QUALITY_FAILURE",
+            "OFFICIAL_TARGETS_SHARED_ACROSS_SERIES_CONFIRMED",
+        ],
+    )
+except Exception:
+    silver_options = {}
+JOIN_THRESHOLD = float(
+    silver_options.get("JOIN_MATCH_THRESHOLD", str(JOIN_THRESHOLD))
+)
+BLOCK_ON_FAILURE = silver_options.get(
+    "BLOCK_ON_QUALITY_FAILURE",
+    "true" if BLOCK_ON_FAILURE else "false",
+).lower() == "true"
+TARGETS_SHARED_ACROSS_SERIES_CONFIRMED = silver_options.get(
+    "OFFICIAL_TARGETS_SHARED_ACROSS_SERIES_CONFIRMED",
+    os.getenv("OFFICIAL_TARGETS_SHARED_ACROSS_SERIES_CONFIRMED", ""),
+).lower() == "true"
 
 BRONZE_PATH = f"s3://{S3_BUCKET}/bronze/"
 SILVER_PATH = f"s3://{S3_BUCKET}/silver/"
-output_path = f"{SILVER_PATH}alunos_curado/"
-
+SILVER_RUN_PATH = f"{SILVER_PATH}runs/{run_id}/"
+output_path = f"{SILVER_RUN_PATH}alunos_oficiais/"
+target_output_paths = {
+    "municipio": f"{SILVER_RUN_PATH}metas_oficiais/municipio/",
+    "uf": f"{SILVER_RUN_PATH}metas_oficiais/uf/",
+    "brasil": f"{SILVER_RUN_PATH}metas_oficiais/brasil/",
+}
 print("=" * 75)
 print(" Iniciando processamento da Camada Silver.")
 print(f"   Bucket: {S3_BUCKET}")
@@ -98,7 +133,12 @@ manifest_prefixes, all_bronze_skipped = validate_bronze_manifest(
 print(f" Manifesto Bronze validado: " f"{bronze_manifest['manifest_s3_uri']}")
 
 # Ignora o reprocessamento quando a Bronze não mudou e a tabela Delta já existe.
-is_delta_existing = DeltaTable.isDeltaTable(spark, output_path)
+latest_approved_silver = get_latest_approved_silver_manifest(
+    s3_client,
+    S3_BUCKET,
+)
+silver_outputs_exist = bool(latest_approved_silver)
+run_table_suffix = re.sub(r"[^A-Za-z0-9_]", "_", run_id)[:40]
 
 
 def _print_table_preview(dataframe, columns):
@@ -213,6 +253,12 @@ def _deduplicate_tables(tables, duplicate_keys):
     print(" 3. Deduplicação das tabelas com chaves repetidas.")
     print("#" * 75 + "\n")
     for name, key_columns in duplicate_keys.items():
+        if name.startswith("meta_alfabetizacao_"):
+            print(
+                f"\nDuplicidades em '{name}' serão validadas pelo contrato anual; "
+                "não selecionar uma linha arbitrariamente."
+            )
+            continue
         print(f"\nAplicando Deduplicação na Tabela {name}...")
         raw_dataframe = tables[name]
         initial_count = raw_dataframe.count()
@@ -321,7 +367,6 @@ def _rename_existing_columns(dataframe, rename_map):
 def _prepare_dimensions(tables):
     municipio = _drop_bronze_metadata(tables["municipio"])
     uf = _drop_bronze_metadata(tables["uf"])
-    meta_municipio = _drop_bronze_metadata(tables["meta_alfabetizacao_municipio"])
 
     municipio_rename = {
         "taxa_alfabetizacao": "taxa_alfabetizacao_municipio",
@@ -337,21 +382,15 @@ def _prepare_dimensions(tables):
                 f"proporcao_aluno_nivel_{index}_{level}"
             )
 
-    meta_rename = {
-        "taxa_alfabetizacao": "taxa_alfabetizacao_meta_mun",
-        "percentual_participacao": "percentual_participacao_meta_mun",
-        "nivel_alfabetizacao": "nivel_alfabetizacao_meta_mun",
-    }
     return (
         _rename_existing_columns(municipio, municipio_rename),
         _rename_existing_columns(uf, uf_rename),
-        _rename_existing_columns(meta_municipio, meta_rename),
     )
 
 
 def _join_and_check_quality(tables):
     students = _derive_student_uf(tables["alunos"])
-    municipality, uf, meta_municipality = _prepare_dimensions(tables)
+    municipality, uf = _prepare_dimensions(tables)
     print("\n" + "#" * 75)
     print(" 5. Executando JOIN relacional.")
     print("#" * 75 + "\n")
@@ -365,11 +404,6 @@ def _join_and_check_quality(tables):
             how="left",
         )
         .join(uf, on=["sigla_uf", "ano", "rede", "serie"], how="left")
-        .join(
-            meta_municipality,
-            on=["id_municipio", "ano", "rede"],
-            how="left",
-        )
     )
     print("\n" + "#" * 75)
     print(" 6. Verificando a taxa de correspondência do JOIN...")
@@ -379,26 +413,9 @@ def _join_and_check_quality(tables):
         df_joined=joined,
         match_key_col="_municipio_match_key",
         threshold_percent=JOIN_THRESHOLD,
-        raise_on_failure=BLOCK_ON_FAILURE,
+        raise_on_failure=False,
     )
     return joined.drop("_municipio_match_key"), match_ratio, metrics
-
-
-def _apply_target_status(dataframe):
-    if (
-        "meta_alfabetizacao_2024" not in dataframe.columns
-        or "taxa_alfabetizacao_municipio" not in dataframe.columns
-    ):
-        return dataframe
-    return dataframe.withColumn(
-        "status_meta_2024",
-        F.when(F.col("meta_alfabetizacao_2024").isNull(), F.lit("Sem Meta Cadastrada"))
-        .when(
-            F.col("taxa_alfabetizacao_municipio") >= F.col("meta_alfabetizacao_2024"),
-            F.lit("Atingiu a Meta"),
-        )
-        .otherwise(F.lit("Não Atingiu a Meta")),
-    )
 
 
 def _persist_curated_dataset(dataframe):
@@ -406,39 +423,72 @@ def _persist_curated_dataset(dataframe):
     print(" 7. Persistindo a Camada Silver em Delta Lake.")
     print("#" * 75 + "\n")
     print(f" Alvo do Dataset Delta Lake: {output_path}")
-    if DeltaTable.isDeltaTable(spark, output_path):
-        print(
-            " Tabela Delta existente detectada. Executando MERGE INTO "
-            "(Upsert por id_aluno + ano)..."
+    if "_source" not in dataframe.columns:
+        raise ValueError("A Silver oficial exige a coluna de proveniência '_source'.")
+    non_official = dataframe.filter(
+        F.col("_source").isNull()
+        | (F.col("_source") != F.lit("basedosdados_bigquery"))
+    ).limit(1).count()
+    if non_official:
+        raise ValueError(
+            "A Silver oficial contém linhas sem proveniência "
+            "basedosdados_bigquery; a publicação foi bloqueada."
         )
-        delta_target = DeltaTable.forPath(spark, output_path)
-        delta_target.alias("target").merge(
-            source=dataframe.alias("source"),
-            condition="target.id_aluno = source.id_aluno AND target.ano = source.ano",
-        ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
-        print("  Operação MERGE INTO executada na tabela Delta Silver.")
-    else:
-        print(" Criando nova Tabela Delta Silver inicial...")
-        dataframe.write.format("delta").mode("overwrite").save(output_path)
-        print("  Tabela Delta Silver inicial gravada.")
+
+    dataframe.write.format("delta").mode("overwrite").option(
+        "overwriteSchema", "true"
+    ).save(output_path)
+    print(" Snapshot oficial de alunos gravado em Delta.")
 
     try:
         spark.sql(
             f"CREATE TABLE IF NOT EXISTS `{GLUE_DATABASE_NAME}`."
-            f"silver_alunos_curado USING DELTA LOCATION '{output_path}'"
+            f"silver_alunos_oficiais_run_{run_table_suffix} "
+            f"USING DELTA LOCATION '{output_path}'"
         )
     except Exception as catalog_error:
         raise RuntimeError(
             f"Não foi possível registrar a tabela Silver no Glue Data Catalog "
-            f"('{GLUE_DATABASE_NAME}.silver_alunos_curado')."
+            f"('{GLUE_DATABASE_NAME}.silver_alunos_oficiais_run_"
+            f"{run_table_suffix}')."
         ) from catalog_error
     print(
         f" Tabela Silver registrada no Glue Data Catalog: "
-        f"{GLUE_DATABASE_NAME}.silver_alunos_curado"
+        f"{GLUE_DATABASE_NAME}.silver_alunos_oficiais_run_{run_table_suffix}"
     )
 
 
-def _save_silver_manifest(metrics, match_ratio, output_rows):
+def _persist_official_targets(targets):
+    table_names_by_level = {
+        "municipio": f"silver_metas_oficiais_municipio_run_{run_table_suffix}",
+        "uf": f"silver_metas_oficiais_uf_run_{run_table_suffix}",
+        "brasil": f"silver_metas_oficiais_brasil_run_{run_table_suffix}",
+    }
+    for level, dataframe in targets.items():
+        target_path = target_output_paths[level]
+        dataframe.write.format("delta").mode("overwrite").option(
+            "overwriteSchema", "true"
+        ).save(target_path)
+        table_name = table_names_by_level[level]
+        try:
+            spark.sql(
+                f"CREATE TABLE IF NOT EXISTS `{GLUE_DATABASE_NAME}`.`{table_name}` "
+                f"USING DELTA LOCATION '{target_path}'"
+            )
+        except Exception as catalog_error:
+            raise RuntimeError(
+                f"Não foi possível registrar a tabela Silver "
+                f"'{GLUE_DATABASE_NAME}.{table_name}'."
+            ) from catalog_error
+
+
+def _save_silver_manifest(
+    metrics,
+    match_ratio,
+    output_rows,
+    target_counts,
+    quality_report_uri,
+):
     try:
         manifest_data = {
             "job_name": job_name,
@@ -449,11 +499,18 @@ def _save_silver_manifest(metrics, match_ratio, output_rows):
             "output_rows": output_rows,
             "matched_municipality_rows": int(metrics.get("total_matched", 0)),
             "match_ratio": float(metrics.get("match_ratio", 0.0)),
-            "gate_status": "APPROVED" if match_ratio >= JOIN_THRESHOLD else "FAILED",
-            "quality_gate_passed": match_ratio >= JOIN_THRESHOLD,
+            "gate_status": "APPROVED",
+            "publication_status": "COMMITTED",
+            "quality_gate_passed": True,
             "join_match_ratio_percent": float(match_ratio),
             "s3_path": output_path,
             "silver_s3_prefix": output_path,
+            "silver_transform_version": SILVER_TRANSFORM_VERSION,
+            "official_student_s3_prefix": output_path,
+            "official_target_s3_prefixes": target_output_paths,
+            "official_target_rows_by_level": target_counts,
+            "source_manifest": bronze_manifest.get("manifest_s3_uri"),
+            "quality_report_s3_uri": quality_report_uri,
         }
         manifest_key = (
             f"auditoria/silver/ingestion_date={ingestion_date}/"
@@ -473,7 +530,12 @@ def _save_silver_manifest(metrics, match_ratio, output_rows):
     print(f" Manifesto Silver salvo: s3://{S3_BUCKET}/{manifest_key}")
 
 
-if is_delta_existing and all_bronze_skipped:
+if (
+    silver_outputs_exist
+    and all_bronze_skipped
+    and latest_approved_silver.get("silver_transform_version")
+    == SILVER_TRANSFORM_VERSION
+):
     print("\n" + "=" * 75)
     print(" A Camada Bronze não apresenta versões novas.")
     print(" O conjunto Delta existente será mantido.")
@@ -486,7 +548,21 @@ if is_delta_existing and all_bronze_skipped:
         "ingestion_date": ingestion_date,
         "status": "SKIPPED (Already Up-to-Date)",
         "gate_status": "APPROVED",
-        "s3_path": output_path,
+        "publication_status": "COMMITTED",
+        "quality_gate_passed": True,
+        "s3_path": latest_approved_silver["official_student_s3_prefix"],
+        "official_student_s3_prefix": latest_approved_silver[
+            "official_student_s3_prefix"
+        ],
+        "official_target_s3_prefixes": latest_approved_silver[
+            "official_target_s3_prefixes"
+        ],
+        "silver_transform_version": SILVER_TRANSFORM_VERSION,
+        "official_target_rows_by_level": latest_approved_silver.get(
+            "official_target_rows_by_level"
+        ),
+        "source_manifest": latest_approved_silver.get("source_manifest"),
+        "quality_report_s3_uri": latest_approved_silver.get("quality_report_s3_uri"),
     }
     manifest_key = (
         f"auditoria/silver/ingestion_date={ingestion_date}/"
@@ -515,9 +591,9 @@ else:
         "alunos": ["id_aluno", "id_municipio", "ano", "rede", "serie"],
         "municipio": ["id_municipio", "ano", "rede", "serie"],
         "uf": ["sigla_uf", "ano", "rede", "serie"],
-        "meta_alfabetizacao_brasil": ["ano", "rede"],
-        "meta_alfabetizacao_uf": ["sigla_uf", "ano", "rede"],
-        "meta_alfabetizacao_municipio": ["id_municipio", "ano", "rede"],
+        "meta_alfabetizacao_brasil": ["ano", "rede", "serie"],
+        "meta_alfabetizacao_uf": ["sigla_uf", "ano", "rede", "serie"],
+        "meta_alfabetizacao_municipio": ["id_municipio", "ano", "rede", "serie"],
         "dicionario": ["id_tabela", "nome_coluna", "chave"],
     }
 
@@ -539,15 +615,109 @@ else:
     # 4. Limpeza, padronização, JOIN relacional e validação de qualidade.
     df_joined, match_ratio, metrics = _join_and_check_quality(tables)
 
-    # Tripla Categorização do Status da Meta
-    df_joined = _apply_target_status(df_joined)
-
-    # Timestamp de enriquecimento da camada Silver
+    # Timestamp de processamento da camada Silver
     df_joined = df_joined.withColumn("_processed_silver_at", F.current_timestamp())
     output_rows = df_joined.count()
 
+    target_sources = {
+        "municipio": "meta_alfabetizacao_municipio",
+        "uf": "meta_alfabetizacao_uf",
+        "brasil": "meta_alfabetizacao_brasil",
+    }
+    try:
+        normalized_targets = {
+            level: normalize_official_targets(
+                tables[source_name],
+                geo_level=level,
+                source_entity=source_name,
+                source_manifest=bronze_manifest.get("manifest_s3_uri", ""),
+                shared_across_series_confirmed=(
+                    TARGETS_SHARED_ACROSS_SERIES_CONFIRMED
+                ),
+            )
+            for level, source_name in target_sources.items()
+        }
+    except ValueError as error:
+        quality_report_key = (
+            f"auditoria/silver/ingestion_date={ingestion_date}/run_id={run_id}/"
+            "quality_report.json"
+        )
+        report = {
+            "run_id": run_id,
+            "layer": "silver",
+            "status": "FAILED",
+            "checks": [
+                quality_check_result(
+                    rule_id="SILVER-OFFICIAL-TARGET-CONTRACT",
+                    scope="all",
+                    status="FAIL",
+                    blocking=True,
+                    source="bronze_official_targets",
+                    detail=str(error),
+                )
+            ],
+        }
+        persist_quality_report(s3_client, S3_BUCKET, quality_report_key, report)
+        raise
+    target_counts = {
+        level: dataframe.count() for level, dataframe in normalized_targets.items()
+    }
+
+    match_passed = match_ratio >= JOIN_THRESHOLD
+    match_status = (
+        "PASS" if match_passed else ("FAIL" if BLOCK_ON_FAILURE else "WARN")
+    )
+    cardinality_passed = output_rows == int(metrics.get("total_left", 0))
+    quality_checks = [
+        quality_check_result(
+            rule_id="SILVER-MUNICIPALITY-MATCH-RATIO",
+            scope="students",
+            status=match_status,
+            blocking=BLOCK_ON_FAILURE,
+            threshold=JOIN_THRESHOLD,
+            observed=match_ratio,
+            denominator=metrics.get("total_left"),
+            source="municipality_dimension_join",
+        ),
+        quality_check_result(
+            rule_id="SILVER-JOIN-CARDINALITY",
+            scope="students",
+            status="PASS" if cardinality_passed else "FAIL",
+            blocking=True,
+            observed=output_rows,
+            denominator=metrics.get("total_left"),
+            source="students_to_dimensions_left_joins",
+            detail="Os joins dimensionais não podem multiplicar linhas de alunos.",
+        ),
+    ]
+    quality_report_key = (
+        f"auditoria/silver/ingestion_date={ingestion_date}/run_id={run_id}/"
+        "quality_report.json"
+    )
+    quality_report = {
+        "run_id": run_id,
+        "layer": "silver",
+        "status": "APPROVED"
+        if match_status != "FAIL" and cardinality_passed
+        else "FAILED",
+        "checks": quality_checks,
+    }
+    persist_quality_report(s3_client, S3_BUCKET, quality_report_key, quality_report)
+    if quality_report["status"] != "APPROVED":
+        raise ValueError(
+            "Gates de qualidade Silver reprovados; a execução não foi publicada."
+        )
+    quality_report_uri = f"s3://{S3_BUCKET}/{quality_report_key}"
+
     _persist_curated_dataset(df_joined)
-    _save_silver_manifest(metrics, match_ratio, output_rows)
+    _persist_official_targets(normalized_targets)
+    _save_silver_manifest(
+        metrics,
+        match_ratio,
+        output_rows,
+        target_counts,
+        quality_report_uri,
+    )
 
 print("\n" + "=" * 75)
 print("Camada Silver concluída.")

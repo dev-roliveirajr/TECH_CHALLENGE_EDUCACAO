@@ -3,24 +3,23 @@
 ORQUESTRADOR DE PIPELINE DE EVENTOS STREAMING (src/pipeline_events.py)
 ===============================================================================
 Descrição: Plano de controle para consumo e processamento incremental de eventos
-em tempo quase real (Streaming / Micro-batch).
+em micro-lotes sob demanda, sem mesclar eventos sintéticos à Silver oficial.
 Verifica a presença de novos eventos na Landing Zone (S3 ou local), executa o
-processador Delta Lake Silver (04_events_processor), atualiza a Camada Gold
-(03_gold_aggregation) e sincroniza os datasets Parquet em 'data/features/'.
+processador de eventos (04_events_processor) e preserva os datasets Gold
+oficiais sem reprocessá-los.
 ===============================================================================
 """
 
 import os
 import sys
 import time
-import shutil
-import tempfile
 import argparse
 import datetime
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from dotenv import load_dotenv
+from common.gold_sync import sync_committed_gold
 
 try:
     import boto3
@@ -51,7 +50,6 @@ else:
 
 POLLING_INTERVAL_SECONDS = int(os.getenv("GLUE_POLLING_INTERVAL", "10"))
 EVENTS_JOB_NAME = "04_events_processor"
-GOLD_JOB_NAME = "03_gold_aggregation"
 
 
 def send_failure_email_notification(
@@ -334,7 +332,7 @@ def run_local_script_fallback(job_name: str) -> str:
 
 
 def sync_gold_features_locally():
-    """Sincroniza e consolida os datasets Parquet da Camada Gold do S3 para 'data/features/'."""
+    """Sincroniza localmente os datasets do último manifesto Gold aprovado."""
     print("\n--------------------------------------------------")
     print(
         " Sincronizando e consolidando datasets Gold localmente em 'data/features/'..."
@@ -350,64 +348,8 @@ def sync_gold_features_locally():
         return
 
     local_output_dir = os.path.join(os.getcwd(), "data", "features")
-    os.makedirs(local_output_dir, exist_ok=True)
-
-    gold_datasets = {
-        "gold_features_alfabetizacao": "gold/gold_features_alfabetizacao/",
-        "gold_features_alfabetizacao_uf": "gold/gold_features_alfabetizacao_uf/",
-        "gold_features_alfabetizacao_brasil": "gold/gold_features_alfabetizacao_brasil/",
-        "gold_indicadores_municipais": "gold/gold_indicadores_municipais/",
-        "gold_indicadores_uf": "gold/gold_indicadores_uf/",
-        "gold_indicadores_brasil": "gold/gold_indicadores_brasil/",
-        "gold_desempenho_vs_metas": "gold/gold_desempenho_vs_metas/",
-        "gold_desempenho_vs_metas_uf": "gold/gold_desempenho_vs_metas_uf/",
-        "gold_desempenho_vs_metas_brasil": "gold/gold_desempenho_vs_metas_brasil/",
-    }
-
-    try:
-        for dataset_name, s3_prefix in gold_datasets.items():
-            temp_dir = tempfile.mkdtemp()
-            try:
-                paginator = s3_client.get_paginator("list_objects_v2")
-                parquet_keys = [
-                    obj["Key"]
-                    for page in paginator.paginate(
-                        Bucket=FULL_BUCKET_NAME,
-                        Prefix=s3_prefix,
-                    )
-                    for obj in page.get("Contents", [])
-                    if obj["Key"].endswith(".parquet")
-                    and not obj["Key"].split("/")[-1].startswith(".")
-                ]
-                if not parquet_keys:
-                    print(f" Aviso: Nenhum arquivo Parquet encontrado em {s3_prefix}.")
-                    continue
-
-                downloaded_files = []
-                for i, key in enumerate(parquet_keys):
-                    local_tmp_file = os.path.join(temp_dir, f"part_{i}.parquet")
-                    s3_client.download_file(FULL_BUCKET_NAME, key, local_tmp_file)
-                    downloaded_files.append(local_tmp_file)
-
-                dfs = [pd.read_parquet(f) for f in downloaded_files]
-                df_consolidated = pd.concat(dfs, ignore_index=True)
-
-                target_file_path = os.path.join(
-                    local_output_dir, f"{dataset_name}.parquet"
-                )
-                df_consolidated.to_parquet(target_file_path, index=False)
-                print(
-                    f"  └─  Dataset consolidado salvo : {target_file_path} ({len(df_consolidated):,} linhas)"
-                )
-
-            except Exception as e:
-                print(f" Alerta ao sincronizar {dataset_name} do S3: {e}")
-            finally:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-    except Exception as s3_err:
-        print(
-            f" Sincronização S3 ignorada ({s3_err}). Mantendo arquivos locais em 'data/features/'."
-        )
+    run_id = sync_committed_gold(s3_client, FULL_BUCKET_NAME, local_output_dir)
+    print(f"  └─  Datasets sincronizados do run Gold comprometido: {run_id}")
 
     print("--------------------------------------------------\n")
 
@@ -447,7 +389,7 @@ def main():
 
     # 2. Execução do Processador de Eventos (04_events_processor)
     print("\n" + "=" * 75)
-    print(" 1. Iniciando Processamento de Eventos (Bronze ➔ Silver Upsert)...")
+    print(" 1. Iniciando Processamento de Eventos isolados da Silver oficial...")
     print("=" * 75)
     status_events = run_glue_job(EVENTS_JOB_NAME)
 
@@ -457,23 +399,11 @@ def main():
         )
         sys.exit(1)
 
-    # 3. Re-agregação da Camada Gold
     print("\n" + "=" * 75)
     print(
-        " 2. Re-agregando Camada Gold e Atualizando Feature Store com novos eventos..."
+        "Pipeline de eventos concluído. A Gold oficial não foi alterada "
+        "pelos dados sintéticos."
     )
-    print("=" * 75)
-    status_gold = run_glue_job(GOLD_JOB_NAME)
-
-    if status_gold != "SUCCEEDED":
-        print("\n ALERTA: Re-agregação Gold falhou.")
-        sys.exit(1)
-
-    # 4. Sincronização Local dos Datasets Parquet
-    sync_gold_features_locally()
-
-    print("\n" + "=" * 75)
-    print("Pipeline de eventos concluído.")
     print("=" * 75)
 
 

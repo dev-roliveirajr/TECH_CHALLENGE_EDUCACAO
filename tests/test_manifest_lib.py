@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
@@ -7,6 +8,8 @@ from botocore.exceptions import ClientError
 from common.manifest_lib import (
     get_latest_bronze_manifest,
     get_latest_manifest,
+    get_latest_approved_gold_manifest,
+    get_latest_approved_silver_manifest,
     validate_bronze_manifest,
 )
 
@@ -152,3 +155,88 @@ def test_manifest_listing_permission_failure_is_reported():
 
     with pytest.raises(RuntimeError, match="listar os manifestos"):
         get_latest_bronze_manifest(client, "data-bucket")
+
+
+def _client_for_committed_manifest(manifest, layer_prefix, output_prefixes):
+    paginator = MagicMock()
+
+    def paginate(*, Bucket, Prefix):
+        if Prefix == layer_prefix:
+            return [
+                {
+                    "Contents": [
+                        {
+                            "Key": f"{layer_prefix}ingestion_date=2026-01-03/"
+                            "run_id=run/manifest.json",
+                            "LastModified": datetime(2026, 1, 3, tzinfo=timezone.utc),
+                        }
+                    ]
+                }
+            ]
+        if Prefix in output_prefixes:
+            suffix = "_delta_log/00000000000000000000.json"
+            if layer_prefix.endswith("gold/"):
+                suffix = "part-00000.parquet"
+            return [{"Contents": [{"Key": f"{Prefix}{suffix}"}]}]
+        return []
+
+    paginator.paginate.side_effect = paginate
+    client = MagicMock(get_paginator=MagicMock(return_value=paginator))
+    client.get_object.return_value = {
+        "Body": MagicMock(
+            read=MagicMock(return_value=json.dumps(manifest).encode("utf-8"))
+        )
+    }
+    return client
+
+
+def test_latest_committed_silver_manifest_accepts_skipped_snapshot():
+    outputs = {
+        "municipio": "s3://data-bucket/silver/runs/run/metas/municipio/",
+        "uf": "s3://data-bucket/silver/runs/run/metas/uf/",
+        "brasil": "s3://data-bucket/silver/runs/run/metas/brasil/",
+    }
+    manifest = {
+        "status": "SKIPPED (Already Up-to-Date)",
+        "gate_status": "APPROVED",
+        "publication_status": "COMMITTED",
+        "official_student_s3_prefix": "s3://data-bucket/silver/runs/run/alunos/",
+        "official_target_s3_prefixes": outputs,
+    }
+    client = _client_for_committed_manifest(
+        manifest,
+        "auditoria/silver/",
+        {
+            "silver/runs/run/alunos/",
+            *(uri.removeprefix("s3://data-bucket/") for uri in outputs.values()),
+        },
+    )
+
+    resolved = get_latest_approved_silver_manifest(client, "data-bucket")
+
+    assert resolved == manifest
+
+
+def test_latest_committed_gold_manifest_accepts_skipped_outputs():
+    outputs = {
+        "indicator": "s3://data-bucket/gold/runs/run/indicator/",
+    }
+    manifest = {
+        "status": "SKIPPED (Already Up-to-Date)",
+        "gate_status": "APPROVED",
+        "publication_status": "COMMITTED",
+        "gold_s3_prefixes": outputs,
+    }
+    client = _client_for_committed_manifest(
+        manifest,
+        "auditoria/gold/",
+        {"gold/runs/run/indicator/"},
+    )
+
+    resolved = get_latest_approved_gold_manifest(
+        client,
+        "data-bucket",
+        required_datasets=["indicator"],
+    )
+
+    assert resolved == manifest

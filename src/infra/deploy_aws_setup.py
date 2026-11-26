@@ -19,6 +19,7 @@ Operações:
 
 import json
 import os
+import re
 import shutil
 import tempfile
 import urllib.request
@@ -55,6 +56,12 @@ except ValueError as error:
     ) from error
 if LIFECYCLE_RULES_EXPIRATION_DAYS < 1:
     raise ValueError("LIFECYCLE_RULES_EXPIRATION_DAYS deve ser um inteiro positivo.")
+try:
+    QUARANTINE_RETENTION_DAYS = int(os.getenv("QUARANTINE_RETENTION_DAYS", "10"))
+except ValueError as error:
+    raise ValueError("QUARANTINE_RETENTION_DAYS deve ser um inteiro positivo.") from error
+if QUARANTINE_RETENTION_DAYS < 1:
+    raise ValueError("QUARANTINE_RETENTION_DAYS deve ser um inteiro positivo.")
 
 # Construção da Role ARN do AWS Glue
 raw_glue_role = os.getenv("AWS_GLUE_ROLE_ARN", "LabRole")
@@ -76,6 +83,7 @@ s3_client = boto3.client("s3", region_name=AWS_REGION)
 glue_client = boto3.client("glue", region_name=AWS_REGION)
 sm_client = boto3.client("secretsmanager", region_name=AWS_REGION)
 cw_client = boto3.client("cloudwatch", region_name=AWS_REGION)
+sns_client = boto3.client("sns", region_name=AWS_REGION)
 sts_client = boto3.client("sts", region_name=AWS_REGION)
 
 SCRIPTS_TO_DEPLOY = [
@@ -247,13 +255,22 @@ def setup_s3_lifecycle_rules():
     print(
         f"\n Configurando S3 Lifecycle Rule para Landing Zone em 's3://{S3_BUCKET}'..."
     )
-    rule_id = "ExpireRawLandingZoneEventsAfter7Days"
-    lifecycle_rule = {
-        "ID": rule_id,
-        "Status": "Enabled",
-        "Filter": {"Prefix": "bronze/events_raw_landing/"},
-        "Expiration": {"Days": LIFECYCLE_RULES_EXPIRATION_DAYS},
-    }
+    landing_rule_id = "ExpireRawLandingZoneEvents"
+    quarantine_rule_id = "ExpireEventQuarantine"
+    lifecycle_rules = [
+        {
+            "ID": landing_rule_id,
+            "Status": "Enabled",
+            "Filter": {"Prefix": "bronze/events_raw_landing/"},
+            "Expiration": {"Days": LIFECYCLE_RULES_EXPIRATION_DAYS},
+        },
+        {
+            "ID": quarantine_rule_id,
+            "Status": "Enabled",
+            "Filter": {"Prefix": "silver/quarantine/events/"},
+            "Expiration": {"Days": QUARANTINE_RETENTION_DAYS},
+        },
+    ]
 
     try:
         response = s3_client.get_bucket_lifecycle_configuration(Bucket=S3_BUCKET)
@@ -268,8 +285,11 @@ def setup_s3_lifecycle_rules():
                 f"'{S3_BUCKET}' ({error_code})."
             ) from error
 
-    rules = [rule for rule in existing_rules if rule.get("ID") != rule_id]
-    rules.append(lifecycle_rule)
+    managed_rule_ids = {landing_rule_id, quarantine_rule_id}
+    rules = [
+        rule for rule in existing_rules if rule.get("ID") not in managed_rule_ids
+    ]
+    rules.extend(lifecycle_rules)
     s3_client.put_bucket_lifecycle_configuration(
         Bucket=S3_BUCKET,
         LifecycleConfiguration={"Rules": rules},
@@ -277,6 +297,10 @@ def setup_s3_lifecycle_rules():
     print(
         "  Regra de expiração configurada para "
         f"'bronze/events_raw_landing/' ({LIFECYCLE_RULES_EXPIRATION_DAYS} dias)."
+    )
+    print(
+        "  Regra de expiração configurada para "
+        f"'silver/quarantine/events/' ({QUARANTINE_RETENTION_DAYS} dias)."
     )
 
 
@@ -413,6 +437,14 @@ def _register_glue_job(item, extra_py_files, extra_jars, additional_modules):
             "--enable-metrics": "true",
             "--enable-continuous-cloudwatch-log": "true",
             "--enable-observability-metrics": "true",
+            "--JOIN_MATCH_THRESHOLD": os.getenv("JOIN_MATCH_THRESHOLD", "95.0"),
+            "--BLOCK_ON_QUALITY_FAILURE": os.getenv(
+                "BLOCK_ON_QUALITY_FAILURE", "true"
+            ).lower(),
+            "--QUARANTINE_RETENTION_DAYS": str(QUARANTINE_RETENTION_DAYS),
+            "--OFFICIAL_TARGETS_SHARED_ACROSS_SERIES_CONFIRMED": os.getenv(
+                "OFFICIAL_TARGETS_SHARED_ACROSS_SERIES_CONFIRMED", "false"
+            ).lower(),
             "--conf": "spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog",
         },
         "GlueVersion": "4.0",
@@ -443,9 +475,123 @@ def _register_glue_job(item, extra_py_files, extra_jars, additional_modules):
 
 def setup_cloudwatch_alarms():
     """
-    6. Provisiona CloudWatch Alarms para monitorar falhas nos 4 Glue Jobs.
+    6. Provisiona CloudWatch Alarms e notificação SNS para os 4 Glue Jobs.
     """
-    print("\n 6. Provisionando Alertas do CloudWatch para os Glue Jobs...")
+    print("\n 6. Provisionando Alertas CloudWatch/SNS para os Glue Jobs...")
+
+    notification_email = (
+        os.getenv("SNS_ALERT_EMAIL") or os.getenv("NOTIFICATION_EMAIL", "")
+    ).strip()
+    if not notification_email:
+        raise ValueError(
+            "Configure SNS_ALERT_EMAIL (ou NOTIFICATION_EMAIL) para receber "
+            "os alertas operacionais."
+        )
+    if not AWS_ACCOUNT_ID:
+        raise ValueError(
+            "AWS_ACCOUNT_ID deve estar resolvido antes de provisionar alertas SNS."
+        )
+
+    topic_name = re.sub(
+        r"[^A-Za-z0-9_-]",
+        "-",
+        os.getenv(
+            "SNS_TOPIC_NAME",
+            f"{raw_bucket_name or 'tech-challenge-educacao'}-Glue-Alerts",
+        ),
+    )[:256]
+    try:
+        topic_response = sns_client.create_topic(Name=topic_name)
+        topic_arn = topic_response.get("TopicArn")
+        if not topic_arn:
+            raise RuntimeError("A resposta do SNS não contém TopicArn.")
+
+        topic_attributes = sns_client.get_topic_attributes(TopicArn=topic_arn)
+        try:
+            topic_policy = json.loads(
+                topic_attributes["Attributes"].get("Policy", "{}")
+            )
+        except (KeyError, TypeError, json.JSONDecodeError) as error:
+            raise ValueError("A política atual do tópico SNS não é JSON válido.") from error
+        if not isinstance(topic_policy, dict):
+            raise ValueError("A política atual do tópico SNS deve ser um objeto JSON.")
+        statements = topic_policy.get("Statement", [])
+        if isinstance(statements, dict):
+            statements = [statements]
+        if not isinstance(statements, list) or not all(
+            isinstance(statement, dict) for statement in statements
+        ):
+            raise ValueError("A política do tópico SNS contém Statement inválido.")
+        statements = [
+            statement
+            for statement in statements
+            if statement.get("Sid") != "AllowProjectCloudWatchAlarms"
+        ]
+        statements.append(
+            {
+                "Sid": "AllowProjectCloudWatchAlarms",
+                "Effect": "Allow",
+                "Principal": {"Service": "cloudwatch.amazonaws.com"},
+                "Action": "SNS:Publish",
+                "Resource": topic_arn,
+                "Condition": {
+                    "StringEquals": {"AWS:SourceAccount": AWS_ACCOUNT_ID},
+                    "ArnLike": {
+                        "AWS:SourceArn": (
+                            f"arn:aws:cloudwatch:{AWS_REGION}:{AWS_ACCOUNT_ID}:"
+                            f"alarm:{raw_bucket_name}-GlueJobFailure-*"
+                        )
+                    },
+                },
+            }
+        )
+        topic_policy["Statement"] = statements
+        topic_policy.setdefault("Version", "2012-10-17")
+        sns_client.set_topic_attributes(
+            TopicArn=topic_arn,
+            AttributeName="Policy",
+            AttributeValue=json.dumps(topic_policy),
+        )
+
+        next_token = None
+        subscription_status = None
+        while True:
+            request = {"TopicArn": topic_arn}
+            if next_token:
+                request["NextToken"] = next_token
+            response = sns_client.list_subscriptions_by_topic(**request)
+            for item in response.get("Subscriptions", []):
+                if (
+                    item.get("Protocol") == "email"
+                    and item.get("Endpoint", "").lower()
+                    == notification_email.lower()
+                ):
+                    subscription_status = item.get("SubscriptionArn")
+            next_token = response.get("NextToken")
+            if not next_token:
+                break
+
+        if subscription_status is None:
+            subscription = sns_client.subscribe(
+                TopicArn=topic_arn,
+                Protocol="email",
+                Endpoint=notification_email,
+                ReturnSubscriptionArn=True,
+            )
+            subscription_status = subscription.get("SubscriptionArn")
+        if str(subscription_status).lower() in {
+            "pendingconfirmation",
+            "pending confirmation",
+        }:
+            print(
+                "  └─  Assinatura SNS pendente de confirmação pelo destinatário."
+            )
+        else:
+            print("  └─  Assinatura de e-mail SNS já confirmada.")
+    except ClientError as error:
+        raise RuntimeError(
+            "Não foi possível provisionar o tópico ou a assinatura SNS."
+        ) from error
 
     glue_jobs = [
         "01_bronze_ingestion",
@@ -459,8 +605,16 @@ def setup_cloudwatch_alarms():
         try:
             cw_client.put_metric_alarm(
                 AlarmName=alarm_name,
-                AlarmDescription=f"Alerta de falha ou erro crítico no AWS Glue Job '{job}'.",
+                AlarmDescription=(
+                    f"Ambiente {raw_bucket_name}; conta {AWS_ACCOUNT_ID}; região "
+                    f"{AWS_REGION}; falha no Glue Job {job}; métrica Glue.error.ALL "
+                    "com período de 300 segundos. Investigue o histórico de runs "
+                    f"em https://{AWS_REGION}.console.aws.amazon.com/glue/home"
+                    f"?region={AWS_REGION}#/v2/monitoring."
+                ),
                 ActionsEnabled=True,
+                AlarmActions=[topic_arn],
+                OKActions=[topic_arn],
                 MetricName="glue.error.ALL",
                 Namespace="Glue",
                 Dimensions=[
