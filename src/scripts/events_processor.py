@@ -118,9 +118,7 @@ if not run_id:
             run_id = sys.argv[i + 1]
             break
 if not run_id:
-    run_id = (
-        f"evt_{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}"
-    )
+    run_id = f"evt_{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}"
 safe_run_id = re.sub(r"[^A-Za-z0-9_-]", "_", run_id)
 
 ingestion_date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
@@ -150,9 +148,7 @@ else:
 
 try:
     quarantine_options = (
-        getResolvedOptions(sys.argv, ["QUARANTINE_RETENTION_DAYS"])
-        if HAS_GLUE
-        else {}
+        getResolvedOptions(sys.argv, ["QUARANTINE_RETENTION_DAYS"]) if HAS_GLUE else {}
     )
 except Exception:
     quarantine_options = {}
@@ -164,7 +160,9 @@ try:
         )
     )
 except ValueError as error:
-    raise ValueError("QUARANTINE_RETENTION_DAYS deve ser um inteiro positivo.") from error
+    raise ValueError(
+        "QUARANTINE_RETENTION_DAYS deve ser um inteiro positivo."
+    ) from error
 if QUARANTINE_RETENTION_DAYS < 1:
     raise ValueError("QUARANTINE_RETENTION_DAYS deve ser um inteiro positivo.")
 
@@ -350,12 +348,16 @@ def _quarantine_invalid_events(
     )
     quarantine = invalid_events.select(
         F.col("_raw_payload").alias("raw_payload"),
-        F.col("event_id")
-        if "event_id" in dataframe.columns
-        else F.lit(None).alias("event_id"),
-        F.col("_source")
-        if "_source" in dataframe.columns
-        else F.lit(None).alias("_source"),
+        (
+            F.col("event_id")
+            if "event_id" in dataframe.columns
+            else F.lit(None).alias("event_id")
+        ),
+        (
+            F.col("_source")
+            if "_source" in dataframe.columns
+            else F.lit(None).alias("_source")
+        ),
         F.lit(domain).alias("domain"),
         reason.alias("quarantine_reason"),
         F.lit(safe_run_id).alias("run_id"),
@@ -402,8 +404,7 @@ def process_alunos_batch(df_batch, batch_id):
         ("id_aluno", F.col("id_aluno").isNull() | (F.trim(F.col("id_aluno")) == "")),
         (
             "id_municipio",
-            F.col("id_municipio").isNull()
-            | (F.trim(F.col("id_municipio")) == ""),
+            F.col("id_municipio").isNull() | (F.trim(F.col("id_municipio")) == ""),
         ),
         (
             "id_escola",
@@ -411,11 +412,14 @@ def process_alunos_batch(df_batch, batch_id):
         ),
         ("ano", F.col("ano").isNull()),
         ("serie", F.col("serie").isNull() | (F.trim(F.col("serie")) == "")),
-        ("rede", F.col("rede").isNull() | (~F.col("rede").isin("0", "1", "2", "3", "4", "5", "6"))),
+        (
+            "rede",
+            F.col("rede").isNull()
+            | (~F.col("rede").isin("0", "1", "2", "3", "4", "5", "6")),
+        ),
         (
             "alfabetizado",
-            F.col("alfabetizado").isNull()
-            | (~F.col("alfabetizado").isin("0", "1")),
+            F.col("alfabetizado").isNull() | (~F.col("alfabetizado").isin("0", "1")),
         ),
         ("proficiencia", F.col("proficiencia").isNull() | F.isnan("proficiencia")),
         ("peso_aluno", F.col("peso_aluno").isNull() | (F.col("peso_aluno") <= 0)),
@@ -573,12 +577,10 @@ def process_alunos_batch(df_batch, batch_id):
     )
 
     # Operação de MERGE INTO (Upsert) no Delta Lake Silver
-    event_output_path = (
-        f"{EVENTS_SILVER_BASE}alunos/batch_id={batch_id}/"
-    )
-    df_batch.drop(
-        "_ingested_at_ts", "_event_time_ts", "latencia_segundos"
-    ).write.mode("overwrite").parquet(event_output_path)
+    event_output_path = f"{EVENTS_SILVER_BASE}alunos/batch_id={batch_id}/"
+    df_batch.drop("_ingested_at_ts", "_event_time_ts", "latencia_segundos").write.mode(
+        "overwrite"
+    ).parquet(event_output_path)
     print(f" Eventos sintéticos gravados em destino isolado: {event_output_path}")
 
     processed_alunos_count += batch_count
@@ -625,8 +627,7 @@ def process_metas_batch(df_batch, batch_id, domain):
         ),
         (
             territory_key,
-            F.col(territory_key).isNull()
-            | (F.trim(F.col(territory_key)) == ""),
+            F.col(territory_key).isNull() | (F.trim(F.col(territory_key)) == ""),
         ),
         (
             "_source",
@@ -678,9 +679,7 @@ def process_metas_batch(df_batch, batch_id, domain):
         .withColumn("_processed_silver_at", F.current_timestamp())
     )
 
-    meta_output_path = (
-        f"{EVENTS_SILVER_BASE}metas/{domain}/batch_id={batch_id}/"
-    )
+    meta_output_path = f"{EVENTS_SILVER_BASE}metas/{domain}/batch_id={batch_id}/"
     df_batch.write.mode("overwrite").parquet(meta_output_path)
     print(f"  └─  Evento de meta gravado em destino isolado: {meta_output_path}")
 

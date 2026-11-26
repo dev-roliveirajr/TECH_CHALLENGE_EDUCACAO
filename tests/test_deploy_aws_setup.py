@@ -195,17 +195,11 @@ def test_cloudwatch_alarms_publish_to_idempotent_sns_subscription(
     }
     assert cloudwatch.put_metric_alarm.call_count == 4
     for alarm_call in cloudwatch.put_metric_alarm.call_args_list:
-        assert alarm_call.kwargs["AlarmActions"] == [
-            "arn:aws:sns:us-east-1:123:alerts"
-        ]
-        assert alarm_call.kwargs["OKActions"] == [
-            "arn:aws:sns:us-east-1:123:alerts"
-        ]
+        assert alarm_call.kwargs["AlarmActions"] == ["arn:aws:sns:us-east-1:123:alerts"]
+        assert alarm_call.kwargs["OKActions"] == ["arn:aws:sns:us-east-1:123:alerts"]
 
 
-def test_cloudwatch_alarms_require_notification_email(
-    deploy_module, monkeypatch
-):
+def test_cloudwatch_alarms_require_notification_email(deploy_module, monkeypatch):
     monkeypatch.delenv("SNS_ALERT_EMAIL", raising=False)
     monkeypatch.delenv("NOTIFICATION_EMAIL", raising=False)
 

@@ -100,9 +100,7 @@ def normalize_official_targets(
     if geo_level not in {"municipio", "uf", "brasil"}:
         raise ValueError(f"Nível geográfico de meta inválido: {geo_level!r}.")
 
-    annual_columns = {
-        f"meta_alfabetizacao_{year}" for year in ANNUAL_TARGET_COLUMNS
-    }
+    annual_columns = {f"meta_alfabetizacao_{year}" for year in ANNUAL_TARGET_COLUMNS}
     missing_columns = annual_columns.difference(source.columns)
     if missing_columns:
         raise ValueError(
@@ -123,25 +121,33 @@ def normalize_official_targets(
     if source.limit(1).count() == 0:
         raise ValueError(f"A fonte de metas {source_entity!r} está vazia.")
 
-    invalid_source_rows = source.filter(
-        F.col("_source").isNull()
-        | (F.col("_source") != F.lit("basedosdados_bigquery"))
-    ).limit(1).count()
+    invalid_source_rows = (
+        source.filter(
+            F.col("_source").isNull()
+            | (F.col("_source") != F.lit("basedosdados_bigquery"))
+        )
+        .limit(1)
+        .count()
+    )
     if invalid_source_rows:
         raise ValueError(
             f"A fonte {source_entity!r} contém linhas sem proveniência oficial "
             "basedosdados_bigquery."
         )
-    invalid_target_values = source.filter(
-        reduce(
-            lambda left, right: left | right,
-            [
-                F.col(column).isNotNull() & F.col(column).cast("double").isNull()
-                for column in sorted(annual_columns)
-            ],
-            F.lit(False),
+    invalid_target_values = (
+        source.filter(
+            reduce(
+                lambda left, right: left | right,
+                [
+                    F.col(column).isNotNull() & F.col(column).cast("double").isNull()
+                    for column in sorted(annual_columns)
+                ],
+                F.lit(False),
+            )
         )
-    ).limit(1).count()
+        .limit(1)
+        .count()
+    )
     if invalid_target_values:
         raise ValueError(
             f"A fonte de metas {source_entity!r} contém valores anuais "
@@ -159,9 +165,7 @@ def normalize_official_targets(
             "de permitir essa comparação."
         )
 
-    key_expressions = [
-        F.col(column).alias(column) for column in key_columns
-    ]
+    key_expressions = [F.col(column).alias(column) for column in key_columns]
     source_year = (
         F.col("ano").alias("source_ano")
         if "ano" in source.columns
@@ -189,17 +193,25 @@ def normalize_official_targets(
         F.lit(source_entity).alias("source_entity"),
         F.lit(source_manifest).alias("source_manifest"),
         F.col("_source"),
-        F.col("_ingested_at") if "_ingested_at" in source.columns else F.lit(None).alias("_ingested_at"),
+        (
+            F.col("_ingested_at")
+            if "_ingested_at" in source.columns
+            else F.lit(None).alias("_ingested_at")
+        ),
         F.expr(
             f"stack({len(ANNUAL_TARGET_COLUMNS)}, {stack_values}) "
             "as (target_year, target_percent)"
         ),
     )
 
-    invalid_targets = normalized.filter(
-        F.col("target_percent").isNotNull()
-        & ((F.col("target_percent") < 0) | (F.col("target_percent") > 100))
-    ).limit(1).count()
+    invalid_targets = (
+        normalized.filter(
+            F.col("target_percent").isNotNull()
+            & ((F.col("target_percent") < 0) | (F.col("target_percent") > 100))
+        )
+        .limit(1)
+        .count()
+    )
     if invalid_targets:
         raise ValueError(
             f"A fonte de metas {source_entity!r} contém percentuais fora "
@@ -238,11 +250,15 @@ def normalize_official_targets(
             f"para a chave anual: {[row.asDict() for row in sample]}."
         )
 
-    return grouped.drop(
-        "_source_rows",
-        "_non_null_target_rows",
-        "_distinct_target_values",
-    ).withColumnRenamed("source_ano_min", "source_ano").drop("source_ano_max")
+    return (
+        grouped.drop(
+            "_source_rows",
+            "_non_null_target_rows",
+            "_distinct_target_values",
+        )
+        .withColumnRenamed("source_ano_min", "source_ano")
+        .drop("source_ano_max")
+    )
 
 
 def compare_to_official_target(
@@ -297,9 +313,7 @@ def compare_to_official_target(
         .count()
     )
     if duplicate_targets:
-        raise ValueError(
-            f"Metas Silver não são únicas para a rede {target_network!r}."
-        )
+        raise ValueError(f"Metas Silver não são únicas para a rede {target_network!r}.")
 
     left = indicators.filter(F.col("rede").cast("string") == target_network).alias(
         "indicator"
@@ -351,8 +365,7 @@ def compare_to_official_target(
                 F.lit("Sem Meta Cadastrada"),
             )
             .when(
-                F.col("taxa_alfabetizacao_recalculada")
-                >= F.col("meta_pactuada_anual"),
+                F.col("taxa_alfabetizacao_recalculada") >= F.col("meta_pactuada_anual"),
                 F.lit("Atingiu a Meta"),
             )
             .otherwise(F.lit("Não Atingiu a Meta")),

@@ -41,9 +41,7 @@ def build_finops_measurements(
         quantity_status = "unavailable"
         quantity_source = "AWS Glue run metrics unavailable"
 
-    glue_cost = (
-        dpu_hours * COST_PER_DPU_HOUR_USD if dpu_hours is not None else None
-    )
+    glue_cost = dpu_hours * COST_PER_DPU_HOUR_USD if dpu_hours is not None else None
     common = {
         "run_id": run_id,
         "period_start": _iso_or_none(period_start),

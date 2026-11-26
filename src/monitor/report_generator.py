@@ -29,6 +29,7 @@ if AWS_ACCOUNT_ID and AWS_ACCOUNT_ID not in S3_BUCKET_NAME:
 else:
     FULL_BUCKET_NAME = S3_BUCKET_NAME
 
+
 def _as_utc(value):
     if value.tzinfo is None:
         value = value.replace(tzinfo=datetime.timezone.utc)
@@ -441,8 +442,7 @@ def generate_job_report(
                 ),
                 unit=measurement["unit"],
                 cost=(
-                    f"{measurement['currency']} "
-                    f"{measurement['cost_amount']:.4f}"
+                    f"{measurement['currency']} " f"{measurement['cost_amount']:.4f}"
                     if measurement["cost_amount"] is not None
                     else "N/A"
                 ),

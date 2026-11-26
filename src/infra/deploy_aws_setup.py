@@ -59,7 +59,9 @@ if LIFECYCLE_RULES_EXPIRATION_DAYS < 1:
 try:
     QUARANTINE_RETENTION_DAYS = int(os.getenv("QUARANTINE_RETENTION_DAYS", "10"))
 except ValueError as error:
-    raise ValueError("QUARANTINE_RETENTION_DAYS deve ser um inteiro positivo.") from error
+    raise ValueError(
+        "QUARANTINE_RETENTION_DAYS deve ser um inteiro positivo."
+    ) from error
 if QUARANTINE_RETENTION_DAYS < 1:
     raise ValueError("QUARANTINE_RETENTION_DAYS deve ser um inteiro positivo.")
 
@@ -286,9 +288,7 @@ def setup_s3_lifecycle_rules():
             ) from error
 
     managed_rule_ids = {landing_rule_id, quarantine_rule_id}
-    rules = [
-        rule for rule in existing_rules if rule.get("ID") not in managed_rule_ids
-    ]
+    rules = [rule for rule in existing_rules if rule.get("ID") not in managed_rule_ids]
     rules.extend(lifecycle_rules)
     s3_client.put_bucket_lifecycle_configuration(
         Bucket=S3_BUCKET,
@@ -512,7 +512,9 @@ def setup_cloudwatch_alarms():
                 topic_attributes["Attributes"].get("Policy", "{}")
             )
         except (KeyError, TypeError, json.JSONDecodeError) as error:
-            raise ValueError("A política atual do tópico SNS não é JSON válido.") from error
+            raise ValueError(
+                "A política atual do tópico SNS não é JSON válido."
+            ) from error
         if not isinstance(topic_policy, dict):
             raise ValueError("A política atual do tópico SNS deve ser um objeto JSON.")
         statements = topic_policy.get("Statement", [])
@@ -563,8 +565,7 @@ def setup_cloudwatch_alarms():
             for item in response.get("Subscriptions", []):
                 if (
                     item.get("Protocol") == "email"
-                    and item.get("Endpoint", "").lower()
-                    == notification_email.lower()
+                    and item.get("Endpoint", "").lower() == notification_email.lower()
                 ):
                     subscription_status = item.get("SubscriptionArn")
             next_token = response.get("NextToken")
@@ -583,9 +584,7 @@ def setup_cloudwatch_alarms():
             "pendingconfirmation",
             "pending confirmation",
         }:
-            print(
-                "  └─  Assinatura SNS pendente de confirmação pelo destinatário."
-            )
+            print("  └─  Assinatura SNS pendente de confirmação pelo destinatário.")
         else:
             print("  └─  Assinatura de e-mail SNS já confirmada.")
     except ClientError as error:

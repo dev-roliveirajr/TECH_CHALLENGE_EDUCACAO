@@ -317,8 +317,7 @@ def test_legacy_feature_exports_are_descriptive_not_model_features(spark, studen
 
 def test_annual_target_normalization_validates_source_and_conflicts(spark):
     target_columns = {
-        f"meta_alfabetizacao_{year}": 70.0 + year - 2024
-        for year in range(2024, 2031)
+        f"meta_alfabetizacao_{year}": 70.0 + year - 2024 for year in range(2024, 2031)
     }
     source = spark.createDataFrame(
         [
@@ -341,9 +340,7 @@ def test_annual_target_normalization_validates_source_and_conflicts(spark):
         source_manifest="s3://data-bucket/manifest.json",
     )
     assert normalized.count() == 7
-    assert (
-        normalized.filter("target_year = 2030").first()["target_percent"] == 76.0
-    )
+    assert normalized.filter("target_year = 2030").first()["target_percent"] == 76.0
 
     without_series = source.drop("serie")
     with pytest.raises(ValueError, match="não informa 'serie'"):
@@ -355,7 +352,9 @@ def test_annual_target_normalization_validates_source_and_conflicts(spark):
         )
 
     conflicting_source = source.unionByName(
-        source.withColumn("meta_alfabetizacao_2024", source["meta_alfabetizacao_2024"] + 1)
+        source.withColumn(
+            "meta_alfabetizacao_2024", source["meta_alfabetizacao_2024"] + 1
+        )
     )
     with pytest.raises(ValueError, match="valores conflitantes"):
         normalize_official_targets(

@@ -103,8 +103,7 @@ def get_latest_approved_gold_manifest(
         key = item["Key"]
         manifest = _read_manifest(s3_client, bucket_name, key, "Camada Gold")
         if (
-            manifest.get("status")
-            not in {"SUCCEEDED", "SKIPPED (Already Up-to-Date)"}
+            manifest.get("status") not in {"SUCCEEDED", "SKIPPED (Already Up-to-Date)"}
             or manifest.get("gate_status") != "APPROVED"
             or manifest.get("publication_status") != "COMMITTED"
         ):
@@ -175,12 +174,9 @@ def get_latest_approved_silver_manifest(s3_client, bucket_name):
         key=lambda manifest: manifest["LastModified"],
         reverse=True,
     ):
-        manifest = _read_manifest(
-            s3_client, bucket_name, item["Key"], "Camada Silver"
-        )
+        manifest = _read_manifest(s3_client, bucket_name, item["Key"], "Camada Silver")
         if (
-            manifest.get("status")
-            not in {"SUCCEEDED", "SKIPPED (Already Up-to-Date)"}
+            manifest.get("status") not in {"SUCCEEDED", "SKIPPED (Already Up-to-Date)"}
             or manifest.get("gate_status") != "APPROVED"
             or manifest.get("publication_status") != "COMMITTED"
         ):

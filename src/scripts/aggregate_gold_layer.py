@@ -63,8 +63,7 @@ TARGET_PATHS = {}
 GOLD_PATH = f"s3://{S3_BUCKET}/gold/"
 AUDIT_PATH = f"s3://{S3_BUCKET}/auditoria/gold/"
 SHARED_SERIES_CONFIRMED = (
-    os.getenv("OFFICIAL_TARGETS_SHARED_ACROSS_SERIES_CONFIRMED", "").lower()
-    == "true"
+    os.getenv("OFFICIAL_TARGETS_SHARED_ACROSS_SERIES_CONFIRMED", "").lower() == "true"
 )
 try:
     gold_options = getResolvedOptions(
@@ -73,10 +72,13 @@ try:
     )
 except Exception:
     gold_options = {}
-SHARED_SERIES_CONFIRMED = gold_options.get(
-    "OFFICIAL_TARGETS_SHARED_ACROSS_SERIES_CONFIRMED",
-    str(SHARED_SERIES_CONFIRMED),
-).lower() == "true"
+SHARED_SERIES_CONFIRMED = (
+    gold_options.get(
+        "OFFICIAL_TARGETS_SHARED_ACROSS_SERIES_CONFIRMED",
+        str(SHARED_SERIES_CONFIRMED),
+    ).lower()
+    == "true"
+)
 
 run_id = os.getenv(
     "GLUE_RUN_ID",
@@ -316,11 +318,17 @@ else:
     # 1. Leitura do Dataset Curado da Camada Silver
     df_silver, total_silver_rows = _read_silver_dataset()
     if "_source" not in df_silver.columns:
-        raise ValueError("A Silver oficial não contém a coluna de proveniência '_source'.")
-    non_official_rows = df_silver.filter(
-        F.col("_source").isNull()
-        | (F.col("_source") != F.lit("basedosdados_bigquery"))
-    ).limit(1).count()
+        raise ValueError(
+            "A Silver oficial não contém a coluna de proveniência '_source'."
+        )
+    non_official_rows = (
+        df_silver.filter(
+            F.col("_source").isNull()
+            | (F.col("_source") != F.lit("basedosdados_bigquery"))
+        )
+        .limit(1)
+        .count()
+    )
     if non_official_rows:
         raise ValueError(
             "A Gold oficial recebeu linhas sem proveniência "
@@ -485,13 +493,14 @@ else:
     quality_report = {
         "run_id": run_id,
         "layer": "gold",
-        "status": "APPROVED"
-        if all(
-            check["status"] in {"PASS", "NOT_APPLICABLE"}
-            or not check["blocking"]
-            for check in quality_checks
-        )
-        else "FAILED",
+        "status": (
+            "APPROVED"
+            if all(
+                check["status"] in {"PASS", "NOT_APPLICABLE"} or not check["blocking"]
+                for check in quality_checks
+            )
+            else "FAILED"
+        ),
         "checks": quality_checks,
     }
     quality_report_key = (

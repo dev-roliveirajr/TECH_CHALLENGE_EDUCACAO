@@ -42,9 +42,10 @@ def test_sync_committed_gold_uses_only_manifest_outputs(tmp_path, monkeypatch):
     for local_name in gold_sync.GOLD_LOCAL_DATASETS:
         target = tmp_path / f"{local_name}.parquet"
         assert target.is_file()
-        assert pd.read_parquet(target).iloc[0]["source_key"].startswith(
-            "gold/runs/run-1/"
+        assert (
+            pd.read_parquet(target).iloc[0]["source_key"].startswith("gold/runs/run-1/")
         )
+
 
 def test_sync_committed_gold_rejects_missing_commit_before_writing(
     tmp_path, monkeypatch

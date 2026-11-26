@@ -155,7 +155,7 @@ def sync_gold_features_locally():
     print(
         " Sincronizando e consolidando datasets Gold localmente em 'data/features/'..."
     )
-    print("--------------------------------------------------"    )
+    print("--------------------------------------------------")
 
     s3_client = get_s3_client()
     local_output_dir = os.path.join(os.getcwd(), "data", "features")

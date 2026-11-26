@@ -82,17 +82,21 @@ try:
     )
 except Exception:
     silver_options = {}
-JOIN_THRESHOLD = float(
-    silver_options.get("JOIN_MATCH_THRESHOLD", str(JOIN_THRESHOLD))
+JOIN_THRESHOLD = float(silver_options.get("JOIN_MATCH_THRESHOLD", str(JOIN_THRESHOLD)))
+BLOCK_ON_FAILURE = (
+    silver_options.get(
+        "BLOCK_ON_QUALITY_FAILURE",
+        "true" if BLOCK_ON_FAILURE else "false",
+    ).lower()
+    == "true"
 )
-BLOCK_ON_FAILURE = silver_options.get(
-    "BLOCK_ON_QUALITY_FAILURE",
-    "true" if BLOCK_ON_FAILURE else "false",
-).lower() == "true"
-TARGETS_SHARED_ACROSS_SERIES_CONFIRMED = silver_options.get(
-    "OFFICIAL_TARGETS_SHARED_ACROSS_SERIES_CONFIRMED",
-    os.getenv("OFFICIAL_TARGETS_SHARED_ACROSS_SERIES_CONFIRMED", ""),
-).lower() == "true"
+TARGETS_SHARED_ACROSS_SERIES_CONFIRMED = (
+    silver_options.get(
+        "OFFICIAL_TARGETS_SHARED_ACROSS_SERIES_CONFIRMED",
+        os.getenv("OFFICIAL_TARGETS_SHARED_ACROSS_SERIES_CONFIRMED", ""),
+    ).lower()
+    == "true"
+)
 
 BRONZE_PATH = f"s3://{S3_BUCKET}/bronze/"
 SILVER_PATH = f"s3://{S3_BUCKET}/silver/"
@@ -397,14 +401,11 @@ def _join_and_check_quality(tables):
     municipality = municipality.withColumn(
         "_municipio_match_key", F.col("id_municipio")
     )
-    joined = (
-        students.join(
-            municipality,
-            on=["id_municipio", "ano", "rede", "serie"],
-            how="left",
-        )
-        .join(uf, on=["sigla_uf", "ano", "rede", "serie"], how="left")
-    )
+    joined = students.join(
+        municipality,
+        on=["id_municipio", "ano", "rede", "serie"],
+        how="left",
+    ).join(uf, on=["sigla_uf", "ano", "rede", "serie"], how="left")
     print("\n" + "#" * 75)
     print(" 6. Verificando a taxa de correspondência do JOIN...")
     print("#" * 75 + "\n")
@@ -425,10 +426,14 @@ def _persist_curated_dataset(dataframe):
     print(f" Alvo do Dataset Delta Lake: {output_path}")
     if "_source" not in dataframe.columns:
         raise ValueError("A Silver oficial exige a coluna de proveniência '_source'.")
-    non_official = dataframe.filter(
-        F.col("_source").isNull()
-        | (F.col("_source") != F.lit("basedosdados_bigquery"))
-    ).limit(1).count()
+    non_official = (
+        dataframe.filter(
+            F.col("_source").isNull()
+            | (F.col("_source") != F.lit("basedosdados_bigquery"))
+        )
+        .limit(1)
+        .count()
+    )
     if non_official:
         raise ValueError(
             "A Silver oficial contém linhas sem proveniência "
@@ -631,9 +636,7 @@ else:
                 geo_level=level,
                 source_entity=source_name,
                 source_manifest=bronze_manifest.get("manifest_s3_uri", ""),
-                shared_across_series_confirmed=(
-                    TARGETS_SHARED_ACROSS_SERIES_CONFIRMED
-                ),
+                shared_across_series_confirmed=(TARGETS_SHARED_ACROSS_SERIES_CONFIRMED),
             )
             for level, source_name in target_sources.items()
         }
@@ -664,9 +667,7 @@ else:
     }
 
     match_passed = match_ratio >= JOIN_THRESHOLD
-    match_status = (
-        "PASS" if match_passed else ("FAIL" if BLOCK_ON_FAILURE else "WARN")
-    )
+    match_status = "PASS" if match_passed else ("FAIL" if BLOCK_ON_FAILURE else "WARN")
     cardinality_passed = output_rows == int(metrics.get("total_left", 0))
     quality_checks = [
         quality_check_result(
@@ -697,9 +698,9 @@ else:
     quality_report = {
         "run_id": run_id,
         "layer": "silver",
-        "status": "APPROVED"
-        if match_status != "FAIL" and cardinality_passed
-        else "FAILED",
+        "status": (
+            "APPROVED" if match_status != "FAIL" and cardinality_passed else "FAILED"
+        ),
         "checks": quality_checks,
     }
     persist_quality_report(s3_client, S3_BUCKET, quality_report_key, quality_report)
